@@ -11,6 +11,14 @@ const router = Router();
 /**
  * GET /api/download/:roomId/:fileId/:chunkIndex
  * Streams an encrypted chunk from S3 to the client.
+ *
+ * Validates that:
+ *   - chunkIndex is a non-negative integer
+ *   - the file record exists and is complete
+ *   - chunkIndex is within [0, totalChunks)
+ *
+ * This prevents clients from issuing unlimited chunk requests which would
+ * flood S3 and crash the backend.
  */
 router.get("/download/:roomId/:fileId/:chunkIndex", async (req, res, next) => {
   try {
@@ -23,8 +31,26 @@ router.get("/download/:roomId/:fileId/:chunkIndex", async (req, res, next) => {
       return res.status(400).json({ error: "Invalid chunk index" });
     }
 
-    const stream = await storage.downloadChunk(roomId, fileId, idx);
+    // Validate file exists and chunk index is in range
+    const file = await fileService.getFile(roomId, fileId);
+    if (!file || !file.isComplete) {
+      return res.status(404).json({ error: "File not found" });
+    }
+
+    if (idx >= file.totalChunks) {
+      return res.status(400).json({
+        error: `Chunk index ${idx} out of range (file has ${file.totalChunks} chunks)`,
+      });
+    }
+
+    const { stream, contentLength } = await storage.downloadChunk(roomId, fileId, idx);
+
     res.set("Content-Type", "application/octet-stream");
+    res.set("Cache-Control", "private, max-age=3600"); // Allow client-side caching per session
+    if (contentLength !== undefined) {
+      res.set("Content-Length", String(contentLength));
+    }
+
     stream.pipe(res);
   } catch (err) {
     next(err);

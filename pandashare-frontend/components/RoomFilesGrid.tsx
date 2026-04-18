@@ -14,11 +14,20 @@ import {
 } from "lucide-react";
 import { uploadFile, UploadProgress } from "@/utils/uploadPipeline";
 import { downloadFile, DownloadProgress } from "@/utils/downloadPipeline";
-import { deleteFile as apiDeleteFile, FileMetadata, fromBase64 } from "@/utils/api";
+import {
+  deleteFile as apiDeleteFile,
+  getRoomFiles,
+  FileMetadata,
+  fromBase64,
+} from "@/utils/api";
+import { computeVerifier } from "@/utils/crypto";
 
 interface RoomFilesGridProps {
   roomId: string;
+  roomName: string;
   mode: "password" | "public";
+  /** HMAC verifier for authenticated file-list fetches (empty string for public rooms) */
+  verifier: string;
   urlPassword?: string;
   salt?: string | null;
   baseIV?: string | null;
@@ -39,7 +48,9 @@ interface FileTile {
 
 export function RoomFilesGrid({
   roomId,
+  roomName,
   mode,
+  verifier,
   urlPassword = "",
   salt,
   baseIV,
@@ -117,6 +128,50 @@ export function RoomFilesGrid({
     }
   };
 
+  /**
+   * Refresh the file list from the backend after a successful upload.
+   * For public rooms, just refetch normally; for password rooms, use verifier.
+   */
+  const refreshFileList = async () => {
+    try {
+      if (mode === "public") {
+        const files = await getRoomFiles(roomId, "");
+        if (files) {
+          setFiles(
+            files.map((f) => ({
+              type: "file" as const,
+              id: f.id,
+              name: f.fileName,
+              size: formatFileSize(Number(f.size)),
+              sizeBytes: Number(f.size),
+              totalChunks: f.totalChunks,
+              status: "idle" as const,
+              progress: 0,
+            }))
+          );
+        }
+      } else if (verifier) {
+        const files = await getRoomFiles(roomId, verifier);
+        if (files) {
+          setFiles(
+            files.map((f) => ({
+              type: "file" as const,
+              id: f.id,
+              name: f.fileName,
+              size: formatFileSize(Number(f.size)),
+              sizeBytes: Number(f.size),
+              totalChunks: f.totalChunks,
+              status: "idle" as const,
+              progress: 0,
+            }))
+          );
+        }
+      }
+    } catch (err) {
+      console.error("Failed to refresh file list:", err);
+    }
+  };
+
   // ── Upload Logic ────────────────────────────
 
   const processFiles = (rawFiles: File[]) => {
@@ -167,9 +222,12 @@ export function RoomFilesGrid({
         },
       });
 
-      // Success
+      // Success — refresh list from server to ensure consistent state
       updateTile({ status: "done", progress: 100, totalChunks: result.totalChunks });
-      setTimeout(() => updateTile({ status: "idle", progress: 0 }), 2000);
+      setTimeout(async () => {
+        updateTile({ status: "idle", progress: 0 });
+        await refreshFileList();
+      }, 1500);
     } catch (err) {
       console.error("Upload failed:", err);
       updateTile({
@@ -206,6 +264,8 @@ export function RoomFilesGrid({
       );
     };
 
+    updateTile({ status: "downloading", progress: 0 });
+
     try {
       await downloadFile(roomId, fileId, tile.name, tile.totalChunks, mode, {
         password: actPwd,
@@ -213,7 +273,12 @@ export function RoomFilesGrid({
         baseIV: baseIV || undefined,
         onProgress: (progress: DownloadProgress) => {
           updateTile({
-            status: progress.phase === "decrypting" ? "decrypting" : "downloading",
+            status:
+              progress.phase === "decrypting"
+                ? "decrypting"
+                : progress.phase === "writing" || progress.phase === "assembling"
+                ? "downloading"
+                : "downloading",
             progress: progress.percent,
           });
         },
@@ -404,7 +469,7 @@ export function RoomFilesGrid({
         ))}
       </div>
 
-      {/* Password Prompt Modal */}
+      {/* Password Prompt Modal — only shown when file download needs manual password */}
       {passwordPromptFile && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 font-mono"

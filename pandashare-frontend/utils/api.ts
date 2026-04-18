@@ -15,7 +15,7 @@ export interface RoomMetadata {
   baseIV?: string | null;  // base64
   createdAt: string;
   expiresAt: string;
-  files: FileMetadata[];
+  files: FileMetadata[]; // empty for password rooms until unlocked via getRoomFiles
 }
 
 export interface FileMetadata {
@@ -37,6 +37,7 @@ export async function createRoom(data: {
   mode: "password" | "public";
   salt?: string;
   baseIV?: string;
+  verifier?: string; // HMAC-SHA256(name|password) hex — required for password rooms
   expiresInHours?: number;
 }): Promise<RoomMetadata> {
   return apiJson<RoomMetadata>("/api/rooms", {
@@ -52,6 +53,31 @@ export async function getRoom(nameOrId: string): Promise<RoomMetadata | null> {
     // 404 means room not found — that's expected for new rooms
     if (err instanceof ApiError && err.status === 404) {
       return null;
+    }
+    throw err;
+  }
+}
+
+/**
+ * Fetch the file listing for a password-protected room.
+ * Requires the verifier (HMAC-SHA256(roomName|password)) which is sent
+ * as the x-room-verifier header. Returns null if the verifier is wrong (401).
+ */
+export async function getRoomFiles(
+  nameOrId: string,
+  verifier: string
+): Promise<FileMetadata[] | null> {
+  try {
+    const result = await apiJson<{ files: FileMetadata[] }>(
+      `/api/rooms/${encodeURIComponent(nameOrId)}/files`,
+      {
+        headers: { "x-room-verifier": verifier },
+      }
+    );
+    return result.files;
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 401) {
+      return null; // Wrong password
     }
     throw err;
   }

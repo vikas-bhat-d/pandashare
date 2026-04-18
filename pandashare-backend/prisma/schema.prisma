@@ -13,6 +13,7 @@ model Room {
   mode      RoomMode
   salt      String?  // base64 encoded, null for public rooms
   baseIV    String?  // base64 encoded, null for public rooms
+  verifier  String?  // HMAC-SHA256(roomName | password) hex, null for public rooms
   createdAt DateTime @default(now())
   expiresAt DateTime
   files     File[]

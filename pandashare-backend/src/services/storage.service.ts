@@ -77,20 +77,23 @@ export async function uploadPublicFile(
 
 /**
  * Download a single encrypted chunk from S3.
- * Returns a readable stream.
+ * Returns a readable stream and the byte-length if known.
  */
 export async function downloadChunk(
   roomId: string,
   fileId: string,
   chunkIndex: number
-): Promise<Readable> {
+): Promise<{ stream: Readable; contentLength?: number }> {
   const response = await s3.send(
     new GetObjectCommand({
       Bucket: config.S3_BUCKET,
       Key: getChunkKey(roomId, fileId, chunkIndex),
     })
   );
-  return response.Body as Readable;
+  return {
+    stream: response.Body as Readable,
+    contentLength: response.ContentLength,
+  };
 }
 
 /**

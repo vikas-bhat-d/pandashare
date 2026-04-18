@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
-import { generateRoomName, generateSalt, generateBaseIV } from "@/utils/crypto";
+import { generateRoomName, generateSalt, generateBaseIV, computeVerifier } from "@/utils/crypto";
 import { createRoom, getRoom, toBase64 } from "@/utils/api";
 import { Terminal, ShieldCheck, ShieldOff, ExternalLink } from "lucide-react";
 
@@ -23,19 +23,25 @@ export default function Home() {
     setIsLoading(true);
     try {
       const existingRoom = await getRoom(roomName.trim());
-      console.log(existingRoom);
       if (existingRoom) {
-         const pwdString = isEncrypted && password.trim() ? `|${encodeURIComponent(password.trim())}` : "";
+         const pwdString = existingRoom.mode === "password" && password.trim()
+           ? `|${encodeURIComponent(password.trim())}`
+           : "";
          router.push(`/room/#${encodeURIComponent(existingRoom.name || existingRoom.id)}${pwdString}`);
       } else {
          // Generate crypto params for password-mode rooms
          let salt: string | undefined;
          let baseIV: string | undefined;
+         let verifier: string | undefined;
+
          if (isEncrypted) {
            const saltBytes = await generateSalt();
            const ivBytes = await generateBaseIV();
            salt = toBase64(saltBytes);
            baseIV = toBase64(ivBytes);
+           if (password.trim()) {
+             verifier = await computeVerifier(roomName.trim().toLowerCase(), password.trim());
+           }
          }
 
          const newRoom = await createRoom({
@@ -43,6 +49,7 @@ export default function Home() {
            mode: isEncrypted ? "password" : "public",
            salt,
            baseIV,
+           verifier,
          });
          const hashSuffix = isEncrypted && password.trim() ? `|${encodeURIComponent(password.trim())}` : "";
          router.push(`/room/#${encodeURIComponent(newRoom.name)}${hashSuffix}`);
@@ -54,6 +61,7 @@ export default function Home() {
       setIsLoading(false);
     }
   };
+
 
   return (
     <div className="min-h-screen bg-[#0a0a0a] text-[#f4f4f5] font-mono selection:bg-white/20 flex flex-col">

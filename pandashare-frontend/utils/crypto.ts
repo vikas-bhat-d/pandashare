@@ -115,3 +115,27 @@ export function generateRoomName(): string {
     const num = Math.floor(Math.random() * 1000);
     return `${adj}-${noun}-${num}`.toLowerCase();
 }
+
+/**
+ * Compute HMAC-SHA256(roomName + "|" + password) as a lowercase hex string.
+ * Used as the room verifier: the server stores this and checks it to
+ * authenticate file-list requests, without ever knowing the password.
+ */
+export async function computeVerifier(roomName: string, password: string): Promise<string> {
+  const enc = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(password),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    keyMaterial,
+    enc.encode(roomName + "|" + password)
+  );
+  return Array.from(new Uint8Array(signature))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}

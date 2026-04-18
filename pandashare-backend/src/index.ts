@@ -19,7 +19,7 @@ app.use(
   cors({
     origin: config.CORS_ORIGIN,
     methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type"],
+    allowedHeaders: ["Content-Type", "x-room-verifier"],
   })
 );
 app.use(apiLimiter);
