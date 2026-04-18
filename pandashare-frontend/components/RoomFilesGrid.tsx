@@ -12,6 +12,7 @@ import {
   Trash2,
   FolderOpen,
 } from "lucide-react";
+import { toast } from "sonner";
 import { uploadFile, UploadProgress } from "@/utils/uploadPipeline";
 import { downloadFile, DownloadProgress } from "@/utils/downloadPipeline";
 import {
@@ -237,17 +238,20 @@ export function RoomFilesGrid({
 
       // Success — refresh list from server to ensure consistent state
       updateTile({ status: "done", progress: 100, totalChunks: result.totalChunks });
+      toast.success(`${rawFile.name} uploaded successfully`);
       setTimeout(async () => {
         updateTile({ status: "idle", progress: 0 });
         await refreshFileList();
       }, 1500);
     } catch (err) {
       console.error("Upload failed:", err);
+      const msg = err instanceof Error ? err.message : "Upload failed";
       updateTile({
         status: "error",
         progress: 0,
-        errorMessage: err instanceof Error ? err.message : "Upload failed",
+        errorMessage: msg,
       });
+      toast.error(`Upload failed: ${msg}`);
     }
   };
 
@@ -298,6 +302,7 @@ export function RoomFilesGrid({
       });
 
       updateTile({ status: "done", progress: 100 });
+      toast.success(`${tile.name} downloaded successfully`);
       setTimeout(() => updateTile({ status: "idle", progress: 0 }), 2000);
     } catch (err) {
       console.error("Download failed:", err);
@@ -306,22 +311,34 @@ export function RoomFilesGrid({
       if (msg.includes("Decryption failed")) {
         // Wrong password — show prompt again
         setDecryptionError(msg);
+        toast.error("Decryption failed. Incorrect password?");
         setPasswordPromptFile(fileId);
         updateTile({ status: "idle", progress: 0 });
       } else {
         updateTile({ status: "error", progress: 0, errorMessage: msg });
+        toast.error(`Download failed: ${msg}`);
       }
     }
   };
 
-  const handleDeleteFile = async (fileId: string) => {
-    if (!window.confirm("Are you sure you want to delete this file?")) return;
-    try {
-      await apiDeleteFile(roomId, fileId);
-      setFiles((prev) => prev.filter((f) => f.id !== fileId));
-    } catch (err) {
-      console.error("Delete failed:", err);
-    }
+  const handleDeleteFile = (fileId: string) => {
+    const tile = files.find((f) => f.id === fileId);
+    toast.warning(`Delete "${tile?.name || "file"}"?`, {
+      description: "This action cannot be undone.",
+      action: {
+        label: "Delete",
+        onClick: async () => {
+          try {
+            await apiDeleteFile(roomId, fileId);
+            setFiles((prev) => prev.filter((f) => f.id !== fileId));
+            toast.success("File deleted");
+          } catch (err) {
+            console.error("Delete failed:", err);
+            toast.error("Failed to delete file");
+          }
+        },
+      },
+    });
   };
 
   const handleUploadPasswordSubmit = async () => {

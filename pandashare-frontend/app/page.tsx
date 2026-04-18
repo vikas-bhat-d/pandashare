@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { generateRoomName, generateSalt, generateBaseIV, computeVerifier } from "@/utils/crypto";
 import { createRoom, getRoom, toBase64 } from "@/utils/api";
 import { Terminal, ShieldCheck, ShieldOff, ExternalLink } from "lucide-react";
+import { toast } from "sonner";
 
 export default function Home() {
   const router = useRouter();
@@ -56,7 +57,7 @@ export default function Home() {
       }
     } catch (e) {
       console.error(e);
-      alert("Failed to access room.");
+      toast.error("Failed to access room. Please check your connection.");
     } finally {
       setIsLoading(false);
     }

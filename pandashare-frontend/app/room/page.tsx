@@ -5,6 +5,7 @@ import { getRoom, updateRoomExpiry, getRoomFiles, RoomMetadata, FileMetadata } f
 import { computeVerifier } from "@/utils/crypto";
 import { RoomFilesGrid } from "@/components/RoomFilesGrid";
 import { Shield, Clock, Copy, Check, ArrowLeft, LockKeyhole, AlertCircle } from "lucide-react";
+import { toast } from "sonner";
 import Link from "next/link";
 
 type UnlockState =
@@ -22,7 +23,6 @@ export default function RoomPage() {
   // Expiry state
   const [expiryHours, setExpiryHours] = useState<number>(24);
   const [isUpdatingExpiry, setIsUpdatingExpiry] = useState(false);
-  const [showToast, setShowToast] = useState(false);
 
   // Password prompt state
   const [passwordInput, setPasswordInput] = useState("");
@@ -31,8 +31,7 @@ export default function RoomPage() {
 
   const handleCopy = () => {
     navigator.clipboard.writeText(window.location.href);
-    setShowToast(true);
-    setTimeout(() => setShowToast(false), 2500);
+    toast.success("Link copied to clipboard");
   };
 
   const loadRoom = useCallback(async () => {
@@ -326,14 +325,6 @@ export default function RoomPage() {
           />
         </div>
       </main>
-
-      {/* Copy Toast */}
-      {showToast && (
-        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-white text-black px-4 py-2 rounded-full text-sm font-medium shadow-lg animate-in fade-in slide-in-from-bottom-4 duration-300 z-50 flex items-center space-x-2">
-          <Check size={16} className="text-emerald-500" />
-          <span>Link copied to clipboard</span>
-        </div>
-      )}
     </div>
   );
 }
