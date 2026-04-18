@@ -54,10 +54,37 @@ export async function uploadChunk(
 }
 
 /**
- * Generate a presigned S3 PUT URL for a public file upload.
- * The browser uploads directly to S3 using this URL — the Node server
- * is never in the data path.
- * URL expires in 1 hour by default.
+ * Generate presigned S3 PUT URLs for each encrypted chunk of a password-mode file.
+ * The browser PUTs encrypted chunks directly to S3 — Node is never in the data path.
+ * Each chunk is stored at encrypted/{roomId}/{fileId}.{chunkIndex}, exactly the same
+ * keys the download pipeline already reads, so no download changes are needed.
+ *
+ * @param totalChunks  Must equal Math.ceil(fileSize / CHUNK_SIZE). Validated by caller.
+ * @param expiresIn    URL lifetime in seconds (default 1 hour).
+ */
+export async function getPresignedChunkUploadUrls(
+  roomId: string,
+  fileId: string,
+  totalChunks: number,
+  expiresIn = 3600
+): Promise<string[]> {
+  return Promise.all(
+    Array.from({ length: totalChunks }, (_, i) =>
+      getSignedUrl(
+        s3,
+        new PutObjectCommand({
+          Bucket: config.S3_BUCKET,
+          Key: getChunkKey(roomId, fileId, i),
+          ContentType: "application/octet-stream",
+        }),
+        { expiresIn }
+      )
+    )
+  );
+}
+
+/**
+ * Generate a presigned S3 PUT URL for a single public (unencrypted) file upload.
  */
 export async function getPresignedUploadUrl(
   roomId: string,
@@ -98,16 +125,50 @@ export async function downloadChunk(
 }
 
 /**
+ * Generate presigned S3 GET URLs for every encrypted chunk of a password-mode file.
+ * The browser fetches each chunk directly from S3 — Node is never in the download
+ * data path, so chunk requests don't count against the API rate limit.
+ *
+ * @param totalChunks  Total number of chunks (must match what was uploaded).
+ * @param expiresIn    URL lifetime in seconds (default 1 hour).
+ */
+export async function getPresignedChunkDownloadUrls(
+  roomId: string,
+  fileId: string,
+  totalChunks: number,
+  expiresIn = 3600
+): Promise<string[]> {
+  return Promise.all(
+    Array.from({ length: totalChunks }, (_, i) =>
+      getSignedUrl(
+        s3,
+        new GetObjectCommand({
+          Bucket: config.S3_BUCKET,
+          Key: getChunkKey(roomId, fileId, i),
+        }),
+        { expiresIn }
+      )
+    )
+  );
+}
+
+/**
  * Generate a pre-signed URL for direct download (public mode only).
+ * Embeds ResponseContentDisposition so S3 sends Content-Disposition: attachment
+ * in the response — browsers start a native download instead of navigating to the URL.
  * URL expires in 15 minutes.
  */
 export async function getPresignedDownloadUrl(
   roomId: string,
-  fileId: string
+  fileId: string,
+  fileName?: string
 ): Promise<string> {
   const command = new GetObjectCommand({
     Bucket: config.S3_BUCKET,
     Key: getPublicKey(roomId, fileId),
+    ResponseContentDisposition: fileName
+      ? `attachment; filename="${encodeURIComponent(fileName)}"`
+      : "attachment",
   });
   return getSignedUrl(s3, command, { expiresIn: 900 }); // 15 minutes
 }

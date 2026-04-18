@@ -104,6 +104,24 @@ export async function uploadChunk(
 }
 
 /**
+ * Request presigned S3 PUT URLs for every encrypted chunk of a password-mode file.
+ * The browser PUTs each encrypted chunk directly to S3 — Node never sees the data.
+ * Returns one URL per chunk; url[i] is the presigned PUT for encrypted chunk i.
+ */
+export async function getEncryptedUploadPresignedUrls(
+  roomId: string,
+  fileId: string,
+  fileName: string,
+  size: number,
+  totalChunks: number
+): Promise<{ urls: string[] }> {
+  return apiJson<{ urls: string[] }>("/api/upload/encrypted/presign", {
+    method: "POST",
+    body: JSON.stringify({ roomId, fileId, fileName, size, totalChunks }),
+  });
+}
+
+/**
  * Request a presigned S3 PUT URL for a public file.
  * The browser will PUT the file bytes directly to S3 using this URL.
  */
@@ -156,6 +174,23 @@ export async function downloadChunk(
   chunkIndex: number
 ): Promise<ArrayBuffer> {
   return apiDownload(`/api/download/${encodeURIComponent(roomId)}/${encodeURIComponent(fileId)}/${chunkIndex}`);
+}
+
+/**
+ * Request presigned S3 GET URLs for every encrypted chunk of a password-mode file.
+ * The browser fetches chunks directly from S3 — Node never sees the download traffic
+ * and the API rate limiter is not hit on a per-chunk basis.
+ * Returns one URL per chunk; url[i] is the presigned GET for encrypted chunk i.
+ */
+export async function getEncryptedDownloadPresignedUrls(
+  roomId: string,
+  fileId: string,
+  totalChunks: number
+): Promise<{ urls: string[] }> {
+  return apiJson<{ urls: string[] }>("/api/download/encrypted/presign", {
+    method: "POST",
+    body: JSON.stringify({ roomId, fileId, totalChunks }),
+  });
 }
 
 export async function getPresignedUrl(

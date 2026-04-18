@@ -3,7 +3,17 @@
 // avoiding accumulation of decrypted chunks in memory.
 
 import { decryptChunk, deriveKey } from "./crypto";
-import { downloadChunk, fromBase64, getPresignedUrl } from "./api";
+import { getEncryptedDownloadPresignedUrls, fromBase64, getPresignedUrl } from "./api";
+
+/**
+ * Fetch one encrypted chunk directly from S3 via a presigned GET URL.
+ * Bypasses the Node server entirely — no rate-limit hits per chunk.
+ */
+async function fetchChunkFromUrl(url: string): Promise<ArrayBuffer> {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`S3 chunk fetch failed: ${res.status} ${res.statusText}`);
+  return res.arrayBuffer();
+}
 
 export interface DownloadProgress {
   phase: "downloading" | "decrypting" | "assembling" | "writing";
@@ -97,17 +107,17 @@ export async function downloadFile(
       return;
     }
 
-    // Fallback: fetch into memory, create blob, trigger anchor download
+    // Fallback: click a hidden anchor pointing at the presigned URL.
+    // The URL already carries `response-content-disposition=attachment; filename=...`
+    // set by the backend, so the browser starts a native download without
+    // allocating the file in JS heap — safe for files of any size.
     onProgress?.({ phase: "downloading", chunkIndex: 0, totalChunks: 1, percent: 50 });
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(`Download failed: ${response.status}`);
-    const buffer = await response.arrayBuffer();
-    const blob = new Blob([buffer]);
     const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = fileName;
+    a.href = url;
+    a.rel = "noopener noreferrer";
+    document.body.appendChild(a);
     a.click();
-    URL.revokeObjectURL(a.href);
+    document.body.removeChild(a);
     onProgress?.({ phase: "downloading", chunkIndex: 1, totalChunks: 1, percent: 100 });
     return;
   }
@@ -122,6 +132,10 @@ export async function downloadFile(
     baseIVBytes = fromBase64(baseIV);
     key = await deriveKey(password, saltBytes);
   }
+
+  // Get all presigned S3 GET URLs in a single backend call (1 request total).
+  // All subsequent chunk fetches go directly to S3 — no rate-limit exposure.
+  const { urls } = await getEncryptedDownloadPresignedUrls(roomId, fileId, totalChunks);
 
   // Progress share allocation (password mode only past this point)
   const downloadShare = 40;
@@ -164,12 +178,12 @@ export async function downloadFile(
         });
 
         // Use the already-in-flight request if available, else fetch now
-        const buffer = prefetch ? await prefetch : await downloadChunk(roomId, fileId, i);
+        const buffer = prefetch ? await prefetch : await fetchChunkFromUrl(urls[i]);
         prefetch = null;
 
         // Kick off the next chunk while we decrypt this one
         if (i + 1 < totalChunks) {
-          prefetch = downloadChunk(roomId, fileId, i + 1);
+          prefetch = fetchChunkFromUrl(urls[i + 1]);
         }
 
         if (key && baseIVBytes) {
@@ -224,6 +238,17 @@ export async function downloadFile(
   }
 
   // ── Fallback: Blob assembly (Firefox / Safari) ───────────────────────────
+  // Guard: accumulating all decrypted chunks in JS heap crashes the browser
+  // beyond ~500 MB (100 × 5 MB chunks). File System Access API is required for
+  // large encrypted files. Chrome/Edge/Firefox 111+ all support it.
+  const LARGE_FILE_CHUNK_THRESHOLD = 100;
+  if (totalChunks > LARGE_FILE_CHUNK_THRESHOLD) {
+    throw new Error(
+      "Your browser does not support streaming downloads. " +
+        "Please use Chrome, Edge, or Firefox (v111+) to download files larger than 500 MB."
+    );
+  }
+
   const decryptedChunks: ArrayBuffer[] = [];
 
   // Double-buffer: prefetch next chunk while decrypting current one
@@ -237,12 +262,12 @@ export async function downloadFile(
       percent: Math.round(((i + 0.5) / totalChunks) * downloadShare),
     });
 
-    const buffer = prefetch ? await prefetch : await downloadChunk(roomId, fileId, i);
+    const buffer = prefetch ? await prefetch : await fetchChunkFromUrl(urls[i]);
     prefetch = null;
 
     // Start fetching next chunk while we decrypt this one
     if (i + 1 < totalChunks) {
-      prefetch = downloadChunk(roomId, fileId, i + 1);
+      prefetch = fetchChunkFromUrl(urls[i + 1]);
     }
 
     let decrypted = buffer;

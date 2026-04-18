@@ -32,6 +32,18 @@ const publicCompleteSchema = z.object({
   size: z.number().positive(),
 });
 
+// Max chunks = ceil(2 GB / 5 MB) = 410. Cap at 500 to allow headroom.
+const MAX_ENCRYPTED_CHUNKS = 500;
+const CHUNK_SIZE_BYTES = 5 * 1024 * 1024; // must match frontend CHUNK_SIZE
+
+const encryptedPresignSchema = z.object({
+  roomId: z.string().min(1),
+  fileId: z.string().min(1),
+  fileName: z.string().min(1),
+  size: z.number().positive().max(2 * 1024 * 1024 * 1024), // 2 GB hard cap
+  totalChunks: z.number().int().positive().max(MAX_ENCRYPTED_CHUNKS),
+});
+
 // ──────────────────────────────────────
 // Routes
 // ──────────────────────────────────────
@@ -61,6 +73,41 @@ router.post(
 
       await storage.uploadChunk(roomId, fileId, idx, req.body);
       res.json({ ok: true, chunkIndex: idx });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/**
+ * POST /api/upload/encrypted/presign
+ * Returns N presigned S3 PUT URLs — one per encrypted chunk — so the browser
+ * can PUT each chunk directly to S3 without going through Node.
+ *
+ * Node only handles this one tiny JSON request per file upload.
+ * All chunk data flows browser → S3 directly, bypassing the rate limiter.
+ *
+ * Body: { roomId, fileId, fileName, size, totalChunks }
+ * Response: { urls: string[] }  (url[i] accepts the PUT for chunk i)
+ */
+router.post(
+  "/upload/encrypted/presign",
+  validate(encryptedPresignSchema),
+  async (req, res, next) => {
+    try {
+      const { roomId, fileId, size, totalChunks } =
+        req.body as z.infer<typeof encryptedPresignSchema>;
+
+      // Verify totalChunks is consistent with the declared file size
+      const expectedChunks = Math.ceil(size / CHUNK_SIZE_BYTES);
+      if (totalChunks !== expectedChunks) {
+        return res.status(400).json({
+          error: `totalChunks ${totalChunks} does not match expected ${expectedChunks} for size ${size}`,
+        });
+      }
+
+      const urls = await storage.getPresignedChunkUploadUrls(roomId, fileId, totalChunks);
+      res.json({ urls });
     } catch (err) {
       next(err);
     }

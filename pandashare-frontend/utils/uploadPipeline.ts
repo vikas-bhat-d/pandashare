@@ -1,7 +1,7 @@
 // uploadPipeline.ts — Orchestrates chunked encryption + upload
 
 import { encryptChunk, deriveKey } from "./crypto";
-import { uploadChunk, completeUpload, getPublicUploadPresignedUrl, completePublicUpload } from "./api";
+import { completeUpload, getPublicUploadPresignedUrl, completePublicUpload, getEncryptedUploadPresignedUrls } from "./api";
 
 const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB
 
@@ -38,6 +38,19 @@ async function runConcurrently(
   await Promise.all(
     Array.from({ length: Math.min(concurrency, total) }, worker)
   );
+}
+
+/**
+ * PUT an encrypted ArrayBuffer directly to a presigned S3 chunk URL.
+ * Uses fetch (no progress needed — chunk count drives the indicator).
+ */
+async function putToPresignedChunkUrl(url: string, data: ArrayBuffer): Promise<void> {
+  const res = await fetch(url, {
+    method: "PUT",
+    headers: { "Content-Type": "application/octet-stream" },
+    body: data,
+  });
+  if (!res.ok) throw new Error(`S3 chunk upload failed: ${res.status} ${res.statusText}`);
 }
 
 /**
@@ -128,7 +141,10 @@ export async function uploadFile(
     return { fileId, totalChunks: 1 };
   }
 
-  // ── Password mode: chunked + encrypted upload (3 chunks in parallel) ──────
+  // ── Password mode: presigned per-chunk PUTs (no Node in the data path) ────
+  // Getting all presigned URLs upfront costs exactly 1 backend request.
+  // The actual bytes go directly from the browser to S3, bypassing Node
+  // entirely — no rate-limit hits, no server memory pressure.
   const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
 
   // Derive encryption key
@@ -137,11 +153,13 @@ export async function uploadFile(
     key = await deriveKey(password, salt);
   }
 
-  // Signal that work is starting
+  // 1. Get all presigned PUT URLs in one backend call
   onProgress?.({ phase: "encrypting", chunkIndex: 0, totalChunks, percent: 0 });
+  const { urls } = await getEncryptedUploadPresignedUrls(
+    roomId, fileId, file.name, file.size, totalChunks
+  );
 
-  // Track completed chunks for progress; access from async workers is safe
-  // because JS is single-threaded (no data race on the counter).
+  // 2. Encrypt + PUT each chunk directly to S3 (up to CHUNK_CONCURRENCY at once)
   let completedChunks = 0;
 
   await runConcurrently(totalChunks, CHUNK_CONCURRENCY, async (i) => {
@@ -149,25 +167,23 @@ export async function uploadFile(
     const end = Math.min(start + CHUNK_SIZE, file.size);
     let buffer = await file.slice(start, end).arrayBuffer();
 
-    // Encrypt
     if (key && baseIV) {
       buffer = await encryptChunk(buffer, key, i, baseIV);
     }
 
-    // Upload
-    await uploadChunk(roomId, fileId, i, buffer);
+    // Direct S3 upload — no rate limit hit on the backend
+    await putToPresignedChunkUrl(urls[i], buffer);
 
     completedChunks++;
     onProgress?.({
       phase: "uploading",
       chunkIndex: completedChunks,
       totalChunks,
-      // Reserve last 2% for /complete call
       percent: Math.round((completedChunks / totalChunks) * 98),
     });
   });
 
-  // Finalize — save metadata
+  // 3. Finalize — save metadata (1 backend request)
   onProgress?.({
     phase: "finalizing",
     chunkIndex: totalChunks,
