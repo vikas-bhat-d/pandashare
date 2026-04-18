@@ -113,5 +113,5 @@ export function generateRoomName(): string {
     const adj = adjectives[Math.floor(Math.random() * adjectives.length)];
     const noun = nouns[Math.floor(Math.random() * nouns.length)];
     const num = Math.floor(Math.random() * 1000);
-    return `${adj}-${noun}-${num}`;
+    return `${adj}-${noun}-${num}`.toLowerCase();
 }

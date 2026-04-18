@@ -21,7 +21,7 @@ export async function createRoom(input: CreateRoomInput) {
 
   return prisma.room.create({
     data: {
-      name: input.name,
+      name: input.name.toLowerCase(),
       mode: input.mode,
       salt: input.salt || null,
       baseIV: input.baseIV || null,
@@ -43,7 +43,7 @@ export async function getRoom(nameOrId: string) {
 
   if (!room) {
     room = await prisma.room.findUnique({
-      where: { name: nameOrId },
+      where: { name: nameOrId.toLowerCase() },
       include: { files: { where: { isComplete: true }, orderBy: { uploadedAt: "desc" } } },
     });
   }
