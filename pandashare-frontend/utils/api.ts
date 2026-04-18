@@ -1,7 +1,7 @@
 // api.ts — PandaShare API service layer
 // All HTTP calls to the backend go through here.
 
-import { apiJson, apiBinary, apiDownload } from "./apiClient";
+import { apiJson, apiBinary, apiDownload, ApiError } from "./apiClient";
 
 // ──────────────────────────────────────
 // Types
@@ -50,7 +50,7 @@ export async function getRoom(nameOrId: string): Promise<RoomMetadata | null> {
     return await apiJson<RoomMetadata>(`/api/rooms/${encodeURIComponent(nameOrId)}`);
   } catch (err) {
     // 404 means room not found — that's expected for new rooms
-    if (err instanceof Error && err.message.includes("404")) {
+    if (err instanceof ApiError && err.status === 404) {
       return null;
     }
     throw err;

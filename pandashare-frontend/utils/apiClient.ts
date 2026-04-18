@@ -5,6 +5,21 @@ const BASE_URL = typeof window !== "undefined"
   : "http://localhost:4000";
 
 /**
+ * Custom error class for API failures
+ */
+export class ApiError extends Error {
+  status: number;
+  body: any;
+
+  constructor(message: string, status: number, body?: any) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.body = body;
+  }
+}
+
+/**
  * Make a JSON API request. Automatically sets Content-Type and parses response.
  */
 export async function apiJson<T>(
@@ -21,7 +36,7 @@ export async function apiJson<T>(
 
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || `API error: ${res.status}`);
+    throw new ApiError(body.error || `API error: ${res.status}`, res.status, body);
   }
 
   return res.json();
@@ -42,7 +57,7 @@ export async function apiBinary(
 
   if (!res.ok) {
     const errBody = await res.json().catch(() => ({}));
-    throw new Error(errBody.error || `Upload failed: ${res.status}`);
+    throw new ApiError(errBody.error || `Upload failed: ${res.status}`, res.status, errBody);
   }
 
   return res.json();
@@ -55,7 +70,7 @@ export async function apiDownload(path: string): Promise<ArrayBuffer> {
   const res = await fetch(`${BASE_URL}${path}`);
 
   if (!res.ok) {
-    throw new Error(`Download failed: ${res.status}`);
+    throw new ApiError(`Download failed: ${res.status}`, res.status);
   }
 
   return res.arrayBuffer();

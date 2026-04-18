@@ -23,6 +23,7 @@ export default function Home() {
     setIsLoading(true);
     try {
       const existingRoom = await getRoom(roomName.trim());
+      console.log(existingRoom);
       if (existingRoom) {
          const pwdString = isEncrypted && password.trim() ? `|${encodeURIComponent(password.trim())}` : "";
          router.push(`/room/#${encodeURIComponent(existingRoom.name || existingRoom.id)}${pwdString}`);
