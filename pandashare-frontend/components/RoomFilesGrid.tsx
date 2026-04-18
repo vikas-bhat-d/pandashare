@@ -128,6 +128,10 @@ export function RoomFilesGrid({
     }
   };
 
+  const [uploadPasswordPrompt, setUploadPasswordPrompt] = useState(false);
+  const [pendingUploads, setPendingUploads] = useState<File[] | null>(null);
+  const [uploadPasswordError, setUploadPasswordError] = useState<string | null>(null);
+
   /**
    * Refresh the file list from the backend after a successful upload.
    * For public rooms, just refetch normally; for password rooms, use verifier.
@@ -175,6 +179,15 @@ export function RoomFilesGrid({
   // ── Upload Logic ────────────────────────────
 
   const processFiles = (rawFiles: File[]) => {
+    if (mode === "password" && !password) {
+      setPendingUploads(rawFiles);
+      setUploadPasswordPrompt(true);
+      return;
+    }
+    actualProcessFiles(rawFiles, password);
+  };
+
+  const actualProcessFiles = (rawFiles: File[], currentPassword: string) => {
     const newTiles: FileTile[] = rawFiles.map((f) => ({
       type: "file" as const,
       id: crypto.randomUUID(),
@@ -191,11 +204,11 @@ export function RoomFilesGrid({
     // Start uploading each file
     rawFiles.forEach((rawFile, i) => {
       const tileId = newTiles[i].id;
-      startUpload(rawFile, tileId);
+      startUpload(rawFile, tileId, currentPassword);
     });
   };
 
-  const startUpload = async (rawFile: File, tileId: string) => {
+  const startUpload = async (rawFile: File, tileId: string, currentPassword?: string) => {
     const updateTile = (updates: Partial<FileTile>) => {
       setFiles((prev) =>
         prev.map((t) => (t.id === tileId ? { ...t, ...updates } : t))
@@ -210,7 +223,7 @@ export function RoomFilesGrid({
       if (baseIV) ivBytes = fromBase64(baseIV);
 
       const result = await uploadFile(rawFile, roomId, mode, {
-        password: password || undefined,
+        password: currentPassword || undefined,
         salt: saltBytes,
         baseIV: ivBytes,
         fileId: tileId,
@@ -302,11 +315,36 @@ export function RoomFilesGrid({
   };
 
   const handleDeleteFile = async (fileId: string) => {
+    if (!window.confirm("Are you sure you want to delete this file?")) return;
     try {
       await apiDeleteFile(roomId, fileId);
       setFiles((prev) => prev.filter((f) => f.id !== fileId));
     } catch (err) {
       console.error("Delete failed:", err);
+    }
+  };
+
+  const handleUploadPasswordSubmit = async () => {
+    if (!tempPassword.trim()) return;
+    setUploadPasswordError(null);
+    try {
+      const v = await computeVerifier(roomName, tempPassword.trim());
+      const filesInfo = await getRoomFiles(roomId, v);
+      if (filesInfo === null) {
+        setUploadPasswordError("Incorrect password. Please try again.");
+      } else {
+        const actPwd = tempPassword.trim();
+        setPassword(actPwd);
+        setUploadPasswordPrompt(false);
+        setTempPassword("");
+        if (pendingUploads) {
+          const p = pendingUploads;
+          setPendingUploads(null);
+          actualProcessFiles(p, actPwd);
+        }
+      }
+    } catch {
+      setUploadPasswordError("Failed to verify password.");
     }
   };
 
@@ -526,6 +564,72 @@ export function RoomFilesGrid({
                   disabled={!tempPassword.trim()}
                 >
                   Unlock
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Upload Password Prompt Modal */}
+      {uploadPasswordPrompt && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 font-mono"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) {
+              setUploadPasswordPrompt(false);
+              setPendingUploads(null);
+              setTempPassword("");
+              setUploadPasswordError(null);
+            }
+          }}
+        >
+          <div className="w-full max-w-sm border border-white/10 bg-[#0f0f0f] text-white rounded-lg animate-in fade-in zoom-in-95 duration-200">
+            <div className="p-6 space-y-4">
+              <div className="flex items-center space-x-2 text-[#f4f4f5]">
+                <LockKeyhole size={20} />
+                <h3 className="font-bold text-lg">Encrypted Room</h3>
+              </div>
+              <p className="text-sm text-[#a1a1aa]">
+                Enter the room password to authorize upload and encrypt the files.
+              </p>
+
+              {uploadPasswordError && (
+                <div className="p-2 bg-red-500/10 text-red-400 border border-red-500/20 rounded flex items-center space-x-2">
+                  <AlertCircle size={14} />
+                  <span className="text-xs font-semibold">{uploadPasswordError}</span>
+                </div>
+              )}
+
+              <div className="pt-2">
+                <input
+                  type="password"
+                  className="flex h-10 w-full rounded-md border border-white/10 bg-[#1a1a1a] px-3 py-2 text-sm text-white placeholder:text-[#52525b] focus:outline-none focus:border-white/30 font-mono transition-colors"
+                  placeholder="Room Password"
+                  value={tempPassword}
+                  onChange={(e) => setTempPassword(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && handleUploadPasswordSubmit()}
+                  autoFocus
+                />
+              </div>
+              <div className="flex justify-end space-x-3 pt-4">
+                <button
+                  className="px-4 py-2 text-sm text-[#a1a1aa] hover:text-white transition-colors"
+                  onClick={() => {
+                    setUploadPasswordPrompt(false);
+                    setPendingUploads(null);
+                    setTempPassword("");
+                    setUploadPasswordError(null);
+                  }}
+                >
+                  Cancel
+                </button>
+                <button
+                  className="px-4 py-2 text-sm bg-white text-black font-semibold rounded hover:bg-gray-200 transition-colors disabled:opacity-50"
+                  onClick={handleUploadPasswordSubmit}
+                  disabled={!tempPassword.trim()}
+                >
+                  Confirm Upload
                 </button>
               </div>
             </div>
