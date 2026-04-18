@@ -1,0 +1,16 @@
+import dotenv from "dotenv";
+dotenv.config();
+
+export const config = {
+  PORT: parseInt(process.env.PORT || "4000"),
+  CORS_ORIGIN: process.env.CORS_ORIGIN || "http://localhost:3000",
+  DATABASE_URL: process.env.DATABASE_URL || "",
+  S3_ENDPOINT: process.env.S3_ENDPOINT || "http://localhost:9000",
+  S3_ACCESS_KEY: process.env.S3_ACCESS_KEY || "minioadmin",
+  S3_SECRET_KEY: process.env.S3_SECRET_KEY || "minioadmin",
+  S3_BUCKET: process.env.S3_BUCKET || "pandashare",
+  S3_REGION: process.env.S3_REGION || "us-east-1",
+  MAX_FILE_SIZE: 2 * 1024 * 1024 * 1024, // 2GB
+  CHUNK_SIZE: 5 * 1024 * 1024, // 5MB
+  MAX_EXPIRY_HOURS: 48,
+};

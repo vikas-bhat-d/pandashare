@@ -3,7 +3,7 @@
 import React, { useEffect, useState } from "react";
 import { getRoom, updateRoomExpiry, RoomMetadata } from "@/utils/api";
 import { RoomFilesGrid } from "@/components/RoomFilesGrid";
-import { Shield, Clock, Copy, Check } from "lucide-react";
+import { Shield, Clock, Copy, Check, ArrowLeft } from "lucide-react";
 import Link from "next/link";
 
 export default function RoomPage() {
@@ -27,7 +27,7 @@ export default function RoomPage() {
 
   useEffect(() => {
     async function loadRoom() {
-      // Auto-extract password and roomId from URL hash (#roomId,pass)
+      // Parse hash: #roomName or #roomName|password
       let hash = "";
       if (typeof window !== "undefined" && window.location.hash) {
           hash = window.location.hash.substring(1); // remove '#'
@@ -38,13 +38,19 @@ export default function RoomPage() {
           return;
       }
       
-      const commaIndex = hash.indexOf(",");
+      const separatorIndex = hash.indexOf("|");
       let idOrName = hash;
       let urlPwd = "";
-      if (commaIndex !== -1) {
-          idOrName = hash.substring(0, commaIndex);
-          urlPwd = hash.substring(commaIndex + 1);
+      if (separatorIndex !== -1) {
+          idOrName = hash.substring(0, separatorIndex);
+          urlPwd = hash.substring(separatorIndex + 1);
       }
+      
+      // Decode URI components
+      try {
+        idOrName = decodeURIComponent(idOrName);
+        if (urlPwd) urlPwd = decodeURIComponent(urlPwd);
+      } catch(e) {}
       
       setRoomId(idOrName);
       if (urlPwd) {
@@ -66,7 +72,7 @@ export default function RoomPage() {
     }
     loadRoom();
     
-    // Setup listener for hash changes just in case they navigate within the same page
+    // Setup listener for hash changes
     const handleHashChange = () => loadRoom();
     window.addEventListener("hashchange", handleHashChange);
     return () => window.removeEventListener("hashchange", handleHashChange);
@@ -88,9 +94,20 @@ export default function RoomPage() {
   if (loading) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-[#0a0a0a] text-white font-mono">
-        <div className="animate-pulse flex flex-col items-center">
-           <Shield size={48} className="text-[#a1a1aa] mb-4" />
-           <p className="text-[#a1a1aa]">Loading room environment...</p>
+        <div className="flex flex-col items-center space-y-4">
+           <div className="relative">
+             <Shield size={48} className="text-[#a1a1aa] animate-pulse" />
+             <div className="absolute inset-0 animate-ping">
+               <Shield size={48} className="text-[#a1a1aa] opacity-20" />
+             </div>
+           </div>
+           <p className="text-[#a1a1aa] text-sm">Loading room environment...</p>
+           {/* Skeleton preview */}
+           <div className="mt-8 grid grid-cols-3 gap-4 opacity-20">
+             {[1,2,3].map(i => (
+               <div key={i} className="w-32 h-40 rounded-lg bg-white/5 animate-pulse" />
+             ))}
+           </div>
         </div>
       </div>
     );
@@ -99,41 +116,52 @@ export default function RoomPage() {
   if (!room) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-[#0a0a0a] text-white font-mono">
-        <div className="text-center space-y-4 border border-white/10 p-8 bg-[#0f0f0f] rounded-lg">
+        <div className="text-center space-y-4 border border-white/10 p-8 bg-[#0f0f0f] rounded-lg max-w-md">
            <h1 className="text-3xl font-bold text-red-500">Room Not Found</h1>
-           <p className="text-[#a1a1aa]">The room might have expired, or URL is invalid.</p>
+           <p className="text-[#a1a1aa]">The room might have expired, or the URL is invalid.</p>
+           <Link 
+             href="/" 
+             className="inline-flex items-center gap-2 mt-4 text-sm text-[#a1a1aa] hover:text-white transition-colors border border-white/10 px-4 py-2 rounded hover:border-white/30"
+           >
+             <ArrowLeft size={14} />
+             <span>Back to Home</span>
+           </Link>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-[#0a0a0a] text-[#f4f4f5] font-sans selection:bg-white/20 p-4 sm:p-8">
+    <div className="min-h-screen bg-[#0a0a0a] text-[#f4f4f5] font-mono selection:bg-white/20 p-4 sm:p-8">
       {/* Top Header */}
       <header className="flex flex-col sm:flex-row justify-between items-center mb-10 max-w-7xl mx-auto gap-4">
          <Link href="/" className="flex items-center space-x-2 hover:opacity-80 transition-opacity cursor-pointer text-white">
-            <span className="font-mono text-2xl font-bold tracking-tight">pandashare</span>
+            <span className="text-2xl font-bold tracking-tight">pandashare</span>
          </Link>
          
          <button 
            onClick={handleCopy}
-           className="bg-transparent border border-[#52525b] text-[#a1a1aa] hover:text-white hover:border-white rounded text-xs font-mono px-4 py-2 transition-all flex items-center space-x-2"
+           className="bg-transparent border border-[#52525b] text-[#a1a1aa] hover:text-white hover:border-white rounded text-xs px-4 py-2 transition-all flex items-center space-x-2"
          >
            <Copy size={14} />
-           <span>Copy</span>
+           <span>Copy Link</span>
          </button>
       </header>
 
       <main className="max-w-7xl mx-auto space-y-12">
          <div className="text-center space-y-2 mb-8">
-            <h1 className="text-4xl font-bold font-mono tracking-tight text-white">{room.name}</h1>
+            <h1 className="text-4xl font-bold tracking-tight text-white">{room.name}</h1>
             <div className="flex flex-wrap items-center justify-center gap-3 text-sm mt-3">
-               <span className="bg-white/10 text-white border border-white/10 font-mono px-3 py-1 rounded-sm text-xs tracking-wide">
-                 {room.mode.toUpperCase()} MODE
+               <span className={`border font-mono px-3 py-1 rounded-sm text-xs tracking-wide ${
+                 room.mode === "password" 
+                   ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20" 
+                   : "bg-amber-500/10 text-amber-400 border-amber-500/20"
+               }`}>
+                 {room.mode === "password" ? "🔒 ENCRYPTED" : "🔓 PUBLIC"}
                </span>
                
-               {/* Expiry Settings - available to everyone in this mode as requested */}
-               <div className="flex items-center space-x-2 bg-[#121212] border border-white/10 font-mono text-[#a1a1aa] px-3 py-1.5 rounded-sm shadow-sm">
+               {/* Expiry Settings */}
+               <div className="flex items-center space-x-2 bg-[#121212] border border-white/10 text-[#a1a1aa] px-3 py-1.5 rounded-sm shadow-sm">
                   <Clock size={14} className={isUpdatingExpiry ? "animate-spin text-white" : ""} />
                   <span className="font-medium text-xs">Expires in:</span>
                   <select 
@@ -152,16 +180,23 @@ export default function RoomPage() {
             </div>
          </div>
 
-         {/* Share view - Tiled Grid */}
+         {/* File Grid */}
          <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
-            <RoomFilesGrid roomId={room.id} mode={room.mode} urlPassword={localPassword} />
+            <RoomFilesGrid
+              roomId={room.id}
+              mode={room.mode}
+              urlPassword={localPassword}
+              salt={room.salt}
+              baseIV={room.baseIV}
+              initialFiles={room.files}
+            />
          </div>
       </main>
 
       {/* Copy Toast */}
       {showToast && (
-        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-foreground text-background px-4 py-2 rounded-full text-sm font-medium shadow-lg animate-in fade-in slide-in-from-bottom-4 duration-300 z-50 flex items-center space-x-2">
-           <Check size={16} className="text-secondary" />
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-white text-black px-4 py-2 rounded-full text-sm font-medium shadow-lg animate-in fade-in slide-in-from-bottom-4 duration-300 z-50 flex items-center space-x-2">
+           <Check size={16} className="text-emerald-500" />
            <span>Link copied to clipboard</span>
         </div>
       )}

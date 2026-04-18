@@ -16,8 +16,13 @@ const fontMono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Panda Share ",
-  description: "Zero Knowledge sharing platform",
+  title: "PandaShare — Secure File Sharing",
+  description: "Zero-knowledge, room-based file sharing with end-to-end encryption. Share files of any size with client-side AES-256-GCM encryption.",
+  openGraph: {
+    title: "PandaShare — Secure File Sharing",
+    description: "Zero-knowledge, room-based file sharing with end-to-end encryption.",
+    type: "website",
+  },
 };
 
 export default function RootLayout({
@@ -27,7 +32,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body className={`${fontSans.variable} ${fontMono.variable} antialiased font-serif`}>
+      <body className={`${fontSans.variable} ${fontMono.variable} antialiased font-mono`}>
         {children}
       </body>
     </html>
