@@ -103,6 +103,38 @@ export async function uploadChunk(
   await apiBinary(`/api/upload/${encodeURIComponent(roomId)}/${encodeURIComponent(fileId)}/${chunkIndex}`, chunk);
 }
 
+/**
+ * Request a presigned S3 PUT URL for a public file.
+ * The browser will PUT the file bytes directly to S3 using this URL.
+ */
+export async function getPublicUploadPresignedUrl(
+  roomId: string,
+  fileId: string,
+  fileName: string,
+  size: number
+): Promise<{ url: string }> {
+  return apiJson<{ url: string }>("/api/public-upload/presign", {
+    method: "POST",
+    body: JSON.stringify({ roomId, fileId, fileName, size }),
+  });
+}
+
+/**
+ * Notify the backend that the presigned S3 PUT completed.
+ * This creates the file metadata record in the database.
+ */
+export async function completePublicUpload(
+  roomId: string,
+  fileId: string,
+  fileName: string,
+  size: number
+): Promise<void> {
+  await apiJson("/api/public-upload/complete", {
+    method: "POST",
+    body: JSON.stringify({ roomId, fileId, fileName, size }),
+  });
+}
+
 export async function completeUpload(
   roomId: string,
   fileId: string,

@@ -54,21 +54,22 @@ export async function uploadChunk(
 }
 
 /**
- * Upload a public (unencrypted) file as a single object.
+ * Generate a presigned S3 PUT URL for a public file upload.
+ * The browser uploads directly to S3 using this URL — the Node server
+ * is never in the data path.
+ * URL expires in 1 hour by default.
  */
-export async function uploadPublicFile(
+export async function getPresignedUploadUrl(
   roomId: string,
   fileId: string,
-  body: Buffer
-): Promise<void> {
-  await s3.send(
-    new PutObjectCommand({
-      Bucket: config.S3_BUCKET,
-      Key: getPublicKey(roomId, fileId),
-      Body: body,
-      ContentType: "application/octet-stream",
-    })
-  );
+  expiresIn = 3600
+): Promise<string> {
+  const command = new PutObjectCommand({
+    Bucket: config.S3_BUCKET,
+    Key: getPublicKey(roomId, fileId),
+    ContentType: "application/octet-stream",
+  });
+  return getSignedUrl(s3, command, { expiresIn });
 }
 
 // ──────────────────────────────────────

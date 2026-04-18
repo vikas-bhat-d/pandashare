@@ -18,6 +18,20 @@ const completeUploadSchema = z.object({
   size: z.number().positive(),
 });
 
+const publicPresignSchema = z.object({
+  roomId: z.string().min(1),
+  fileId: z.string().min(1),
+  fileName: z.string().min(1),
+  size: z.number().positive(),
+});
+
+const publicCompleteSchema = z.object({
+  roomId: z.string().min(1),
+  fileId: z.string().min(1),
+  fileName: z.string().min(1),
+  size: z.number().positive(),
+});
+
 // ──────────────────────────────────────
 // Routes
 // ──────────────────────────────────────
@@ -47,6 +61,64 @@ router.post(
 
       await storage.uploadChunk(roomId, fileId, idx, req.body);
       res.json({ ok: true, chunkIndex: idx });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/**
+ * POST /api/public-upload/presign
+ * Returns a presigned S3 PUT URL so the browser can upload directly to S3.
+ * No file data passes through this server.
+ *
+ * Body: { roomId, fileId, fileName, size }
+ */
+router.post(
+  "/public-upload/presign",
+  validate(publicPresignSchema),
+  async (req, res, next) => {
+    try {
+      const { roomId, fileId } = req.body as z.infer<typeof publicPresignSchema>;
+      const url = await storage.getPresignedUploadUrl(roomId, fileId);
+      res.json({ url });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/**
+ * POST /api/public-upload/complete
+ * Called by the frontend after a successful presigned PUT to S3.
+ * Saves the file metadata to the database.
+ *
+ * Body: { roomId, fileId, fileName, size }
+ */
+router.post(
+  "/public-upload/complete",
+  validate(publicCompleteSchema),
+  async (req, res, next) => {
+    try {
+      const { roomId, fileId, fileName, size } = req.body as z.infer<
+        typeof publicCompleteSchema
+      >;
+
+      const file = await fileService.completeUpload({
+        fileId,
+        roomId,
+        fileName,
+        totalChunks: 1,
+        size,
+      });
+
+      res.json({
+        ok: true,
+        file: {
+          ...file,
+          size: file.size.toString(),
+        },
+      });
     } catch (err) {
       next(err);
     }

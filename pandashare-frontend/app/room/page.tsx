@@ -4,7 +4,7 @@ import React, { useEffect, useState, useCallback } from "react";
 import { getRoom, updateRoomExpiry, getRoomFiles, RoomMetadata, FileMetadata } from "@/utils/api";
 import { computeVerifier } from "@/utils/crypto";
 import { RoomFilesGrid } from "@/components/RoomFilesGrid";
-import { Shield, Clock, Copy, Check, ArrowLeft, LockKeyhole, AlertCircle } from "lucide-react";
+import { Shield, Clock, Copy, ArrowLeft, LockKeyhole, AlertCircle, Globe } from "lucide-react";
 import { toast } from "sonner";
 import Link from "next/link";
 
@@ -247,6 +247,7 @@ export default function RoomPage() {
     );
   }
 
+  
   // ── Unlocked room ──────────────────────────────────────────────────────────
 
   if (unlockState.phase !== "unlocked" || !room) return null;
@@ -273,13 +274,18 @@ export default function RoomPage() {
           <h1 className="text-4xl font-bold tracking-tight text-white">{room.name}</h1>
           <div className="flex flex-wrap items-center justify-center gap-3 text-sm mt-3">
             <span
-              className={`border font-mono px-3 py-1 rounded-sm text-xs tracking-wide ${
+              className={`inline-flex items-center gap-2 border font-mono px-3 py-1 rounded-sm text-xs tracking-wide ${
                 room.mode === "password"
                   ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
                   : "bg-amber-500/10 text-amber-400 border-amber-500/20"
               }`}
             >
-              {room.mode === "password" ? "🔒 ENCRYPTED" : "🔓 PUBLIC"}
+              {room.mode === "password" ? (
+                <LockKeyhole size={12} className="shrink-0" />
+              ) : (
+                <Globe size={12} className="shrink-0" />
+              )}
+              {room.mode === "password" ? "ENCRYPTED" : "PUBLIC"}
             </span>
 
             {/* Expiry Settings */}

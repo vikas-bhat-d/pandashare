@@ -3,7 +3,7 @@
 // avoiding accumulation of decrypted chunks in memory.
 
 import { decryptChunk, deriveKey } from "./crypto";
-import { downloadChunk, fromBase64 } from "./api";
+import { downloadChunk, fromBase64, getPresignedUrl } from "./api";
 
 export interface DownloadProgress {
   phase: "downloading" | "decrypting" | "assembling" | "writing";
@@ -45,20 +45,88 @@ export async function downloadFile(
 ): Promise<void> {
   const { password, salt, baseIV, onProgress } = options;
 
-  // Derive key once if password mode
+  // ── Public mode: single-object presigned URL download ──────────────────────
+  // Public files are stored as a single S3 object; no decryption needed.
+  // Stream directly from S3 via a short-lived presigned URL.
+  if (mode === "public") {
+    const url = await getPresignedUrl(roomId, fileId);
+
+    const hasFileSystemAccess =
+      typeof window !== "undefined" && "showSaveFilePicker" in window;
+
+    if (hasFileSystemAccess) {
+      let fileHandle: FileSystemFileHandle;
+      try {
+        fileHandle = await (window as any).showSaveFilePicker({
+          suggestedName: fileName,
+          types: [{ description: "File", accept: { "application/octet-stream": [] } }],
+        });
+      } catch (err: any) {
+        if (err?.name === "AbortError") return;
+        throw err;
+      }
+
+      const writable = await fileHandle.createWritable();
+      try {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`Download failed: ${response.status}`);
+
+        const contentLength = parseInt(response.headers.get("Content-Length") || "0");
+        const reader = response.body!.getReader();
+        let received = 0;
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          await writable.write(value);
+          received += value.byteLength;
+          onProgress?.({
+            phase: "downloading",
+            chunkIndex: 0,
+            totalChunks: 1,
+            percent: contentLength > 0 ? Math.min(99, Math.round((received / contentLength) * 100)) : 50,
+          });
+        }
+
+        await writable.close();
+        onProgress?.({ phase: "writing", chunkIndex: 1, totalChunks: 1, percent: 100 });
+      } catch (err) {
+        await writable.abort().catch(() => {});
+        throw err;
+      }
+      return;
+    }
+
+    // Fallback: fetch into memory, create blob, trigger anchor download
+    onProgress?.({ phase: "downloading", chunkIndex: 0, totalChunks: 1, percent: 50 });
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`Download failed: ${response.status}`);
+    const buffer = await response.arrayBuffer();
+    const blob = new Blob([buffer]);
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = fileName;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    onProgress?.({ phase: "downloading", chunkIndex: 1, totalChunks: 1, percent: 100 });
+    return;
+  }
+
+  // ── Password mode: chunked + decrypted download ─────────────────────────────
+  // Derive key once
   let key: CryptoKey | null = null;
   let baseIVBytes: Uint8Array | null = null;
 
-  if (mode === "password" && password && salt && baseIV) {
+  if (password && salt && baseIV) {
     const saltBytes = fromBase64(salt);
     baseIVBytes = fromBase64(baseIV);
     key = await deriveKey(password, saltBytes);
   }
 
-  // Progress share allocation
-  const downloadShare = mode === "password" ? 40 : 70;
-  const decryptShare  = mode === "password" ? 50 : 0;
-  const writeShare    = 100 - downloadShare - decryptShare; // 10 or 30
+  // Progress share allocation (password mode only past this point)
+  const downloadShare = 40;
+  const decryptShare  = 50;
+  const writeShare    = 10; // 100 - 40 - 50
 
   // ── File System Access API path ─────────────────────────────────────────
   const hasFileSystemAccess =
@@ -82,8 +150,12 @@ export async function downloadFile(
     const writable = await fileHandle.createWritable();
 
     try {
+      // Double-buffer: start fetching chunk i+1 while decrypting chunk i.
+      // This overlaps network I/O with CPU (AES-GCM), cutting total time by
+      // roughly max(download_time, decrypt_time) per chunk instead of their sum.
+      let prefetch: Promise<ArrayBuffer> | null = null;
+
       for (let i = 0; i < totalChunks; i++) {
-        // 1. Download chunk
         onProgress?.({
           phase: "downloading",
           chunkIndex: i,
@@ -91,9 +163,15 @@ export async function downloadFile(
           percent: Math.round(((i + 0.5) / totalChunks) * downloadShare),
         });
 
-        let buffer = await downloadChunk(roomId, fileId, i);
+        // Use the already-in-flight request if available, else fetch now
+        const buffer = prefetch ? await prefetch : await downloadChunk(roomId, fileId, i);
+        prefetch = null;
 
-        // 2. Decrypt if password mode
+        // Kick off the next chunk while we decrypt this one
+        if (i + 1 < totalChunks) {
+          prefetch = downloadChunk(roomId, fileId, i + 1);
+        }
+
         if (key && baseIVBytes) {
           onProgress?.({
             phase: "decrypting",
@@ -104,28 +182,28 @@ export async function downloadFile(
               Math.round(((i + 0.5) / totalChunks) * decryptShare),
           });
 
+          let decrypted: ArrayBuffer;
           try {
-            buffer = await decryptChunk(buffer, key, i, baseIVBytes);
+            decrypted = await decryptChunk(buffer, key, i, baseIVBytes);
           } catch {
             await writable.abort();
             throw new Error(
               "Decryption failed — the password may be incorrect or the data is corrupted."
             );
           }
+
+          onProgress?.({
+            phase: "writing",
+            chunkIndex: i,
+            totalChunks,
+            percent:
+              downloadShare +
+              decryptShare +
+              Math.round(((i + 0.5) / totalChunks) * writeShare),
+          });
+
+          await writable.write(decrypted);
         }
-
-        // 3. Write chunk directly to disk
-        onProgress?.({
-          phase: "writing",
-          chunkIndex: i,
-          totalChunks,
-          percent:
-            downloadShare +
-            decryptShare +
-            Math.round(((i + 0.5) / totalChunks) * writeShare),
-        });
-
-        await writable.write(buffer);
       }
 
       await writable.close();
@@ -146,13 +224,12 @@ export async function downloadFile(
   }
 
   // ── Fallback: Blob assembly (Firefox / Safari) ───────────────────────────
-  // We still process chunks one at a time (sequential) to avoid flooding the
-  // server with parallel requests, but we must keep them in memory.
-
   const decryptedChunks: ArrayBuffer[] = [];
 
+  // Double-buffer: prefetch next chunk while decrypting current one
+  let prefetch: Promise<ArrayBuffer> | null = null;
+
   for (let i = 0; i < totalChunks; i++) {
-    // 1. Download chunk
     onProgress?.({
       phase: "downloading",
       chunkIndex: i,
@@ -160,9 +237,15 @@ export async function downloadFile(
       percent: Math.round(((i + 0.5) / totalChunks) * downloadShare),
     });
 
-    let buffer = await downloadChunk(roomId, fileId, i);
+    const buffer = prefetch ? await prefetch : await downloadChunk(roomId, fileId, i);
+    prefetch = null;
 
-    // 2. Decrypt if password mode
+    // Start fetching next chunk while we decrypt this one
+    if (i + 1 < totalChunks) {
+      prefetch = downloadChunk(roomId, fileId, i + 1);
+    }
+
+    let decrypted = buffer;
     if (key && baseIVBytes) {
       onProgress?.({
         phase: "decrypting",
@@ -174,7 +257,7 @@ export async function downloadFile(
       });
 
       try {
-        buffer = await decryptChunk(buffer, key, i, baseIVBytes);
+        decrypted = await decryptChunk(buffer, key, i, baseIVBytes);
       } catch {
         throw new Error(
           "Decryption failed — the password may be incorrect or the data is corrupted."
@@ -182,7 +265,7 @@ export async function downloadFile(
       }
     }
 
-    decryptedChunks.push(buffer);
+    decryptedChunks.push(decrypted);
   }
 
   // 3. Assemble and trigger browser download

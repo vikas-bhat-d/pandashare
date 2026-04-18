@@ -4,7 +4,7 @@ import React, { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { generateRoomName, generateSalt, generateBaseIV, computeVerifier } from "@/utils/crypto";
 import { createRoom, getRoom, toBase64 } from "@/utils/api";
-import { Terminal, ShieldCheck, ShieldOff, ExternalLink } from "lucide-react";
+import { Terminal, ShieldCheck, ShieldOff, ExternalLink, AlertCircle } from "lucide-react";
 import { toast } from "sonner";
 
 export default function Home() {
@@ -188,8 +188,9 @@ export default function Home() {
 
                  {/* Public mode warning */}
                  {!isEncrypted && (
-                   <div className="text-xs text-amber-400/80 bg-amber-500/5 border border-amber-500/10 rounded px-3 py-2 animate-in fade-in slide-in-from-top-2 duration-200">
-                     ⚠ Files will not be encrypted. Anyone with the room link can access them.
+                   <div className="flex items-center gap-2 text-xs text-amber-400/80 bg-amber-500/5 border border-amber-500/10 rounded px-3 py-2 animate-in fade-in slide-in-from-top-2 duration-200">
+                     <AlertCircle size={14} className="shrink-0" />
+                     Files will not be encrypted. Anyone with the room link can access them.
                    </div>
                  )}
                </div>

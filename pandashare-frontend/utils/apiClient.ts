@@ -5,6 +5,29 @@ const BASE_URL = typeof window !== "undefined"
   : "http://localhost:4000";
 
 /**
+ * Returns a stable UUID that identifies this browser instance.
+ * Generated once on first call and persisted to localStorage under "ps_device_id".
+ * Sent as x-device-id on every API request so the backend can enforce
+ * per-device rate limits independently of the client IP address.
+ *
+ * Why localStorage instead of a cookie: works in all CORS configurations
+ * without requiring credentials-mode or SameSite adjustments.
+ */
+function getDeviceId(): string {
+  if (typeof window === "undefined" || typeof localStorage === "undefined") {
+    // SSR / server-side calls — no persistent identity, skip header
+    return "";
+  }
+  const KEY = "ps_device_id";
+  let id = localStorage.getItem(KEY);
+  if (!id || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) {
+    id = crypto.randomUUID();
+    localStorage.setItem(KEY, id);
+  }
+  return id;
+}
+
+/**
  * Custom error class for API failures
  */
 export class ApiError extends Error {
@@ -26,9 +49,11 @@ export async function apiJson<T>(
   path: string,
   options?: RequestInit
 ): Promise<T> {
+  const deviceId = getDeviceId();
   const res = await fetch(`${BASE_URL}${path}`, {
     headers: {
       "Content-Type": "application/json",
+      ...(deviceId ? { "x-device-id": deviceId } : {}),
       ...options?.headers,
     },
     ...options,
@@ -44,14 +69,21 @@ export async function apiJson<T>(
 
 /**
  * Upload a binary chunk. Sets Content-Type to application/octet-stream.
+ * Pass additional headers (e.g. x-file-name) via the optional `headers` param.
  */
 export async function apiBinary(
   path: string,
-  body: ArrayBuffer
+  body: ArrayBuffer,
+  headers?: Record<string, string>
 ): Promise<{ ok: boolean }> {
+  const deviceId = getDeviceId();
   const res = await fetch(`${BASE_URL}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/octet-stream" },
+    headers: {
+      "Content-Type": "application/octet-stream",
+      ...(deviceId ? { "x-device-id": deviceId } : {}),
+      ...headers,
+    },
     body,
   });
 
