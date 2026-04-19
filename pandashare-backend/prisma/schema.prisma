@@ -31,6 +31,8 @@ model File {
   size        BigInt   // File size in bytes
   uploadedAt  DateTime @default(now())
   isComplete  Boolean  @default(false)
+  isMultipart Boolean  @default(false) // true = stored as single S3 object via multipart upload
+  chunkSize   Int      @default(0)     // plaintext chunk size used during encryption (0 = old chunked format)
 
   @@index([roomId])
 }

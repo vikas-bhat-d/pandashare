@@ -3,6 +3,11 @@ import {
   PutObjectCommand,
   GetObjectCommand,
   DeleteObjectsCommand,
+  DeleteObjectCommand,
+  CreateMultipartUploadCommand,
+  UploadPartCommand,
+  CompleteMultipartUploadCommand,
+  AbortMultipartUploadCommand,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { config } from "../config";
@@ -27,6 +32,14 @@ function getChunkKey(roomId: string, fileId: string, chunkIndex: number): string
 
 function getPublicKey(roomId: string, fileId: string): string {
   return `public/${roomId}/${fileId}`;
+}
+
+/**
+ * Key for a multipart-uploaded encrypted file (stored as one S3 object).
+ * Kept in a separate prefix from old per-chunk objects so deletes are unambiguous.
+ */
+function getMultipartKey(roomId: string, fileId: string): string {
+  return `multipart/${roomId}/${fileId}`;
 }
 
 // ──────────────────────────────────────
@@ -170,6 +183,131 @@ export async function getPresignedDownloadUrl(
       : "attachment",
   });
   return getSignedUrl(s3, command, { expiresIn: 900 }); // 15 minutes
+}
+
+// ──────────────────────────────────────
+// Multipart upload (encrypted, single S3 object)
+// ──────────────────────────────────────
+
+/**
+ * Initiate an S3 multipart upload and return presigned UploadPart URLs.
+ *
+ * The browser uploads each encrypted part directly to S3 using these URLs.
+ * Each part must be >= 5 MB (S3 minimum) except the last part.
+ * The browser captures the ETag from each part response and sends them back
+ * to completeMultipartUpload.
+ *
+ * @param totalParts  Number of encrypted parts (= totalChunks from the frontend).
+ * @param expiresIn   URL lifetime in seconds (default 1 hour).
+ * @returns uploadId and one presigned URL per part.
+ */
+export async function initiateMultipartUpload(
+  roomId: string,
+  fileId: string,
+  totalParts: number,
+  expiresIn = 3600
+): Promise<{ uploadId: string; urls: string[] }> {
+  const key = getMultipartKey(roomId, fileId);
+
+  const { UploadId } = await s3.send(
+    new CreateMultipartUploadCommand({
+      Bucket: config.S3_BUCKET,
+      Key: key,
+      ContentType: "application/octet-stream",
+    })
+  );
+
+  if (!UploadId) throw new Error("S3 did not return an UploadId");
+
+  const urls = await Promise.all(
+    Array.from({ length: totalParts }, (_, i) =>
+      getSignedUrl(
+        s3,
+        new UploadPartCommand({
+          Bucket: config.S3_BUCKET,
+          Key: key,
+          UploadId,
+          PartNumber: i + 1, // S3 part numbers are 1-based
+        }),
+        { expiresIn }
+      )
+    )
+  );
+
+  return { uploadId: UploadId, urls };
+}
+
+/**
+ * Complete a multipart upload after all parts have been PUT.
+ *
+ * @param parts  Array of { PartNumber, ETag } captured by the browser from each PUT response.
+ */
+export async function completeMultipartUpload(
+  roomId: string,
+  fileId: string,
+  uploadId: string,
+  parts: Array<{ PartNumber: number; ETag: string }>
+): Promise<void> {
+  await s3.send(
+    new CompleteMultipartUploadCommand({
+      Bucket: config.S3_BUCKET,
+      Key: getMultipartKey(roomId, fileId),
+      UploadId: uploadId,
+      MultipartUpload: { Parts: parts },
+    })
+  );
+}
+
+/**
+ * Abort a multipart upload (called on error to free S3 storage for incomplete parts).
+ */
+export async function abortMultipartUpload(
+  roomId: string,
+  fileId: string,
+  uploadId: string
+): Promise<void> {
+  await s3.send(
+    new AbortMultipartUploadCommand({
+      Bucket: config.S3_BUCKET,
+      Key: getMultipartKey(roomId, fileId),
+      UploadId: uploadId,
+    })
+  ).catch(() => {}); // best-effort
+}
+
+/**
+ * Generate a presigned GET URL for a multipart-uploaded encrypted file.
+ * The browser downloads the entire object in one streaming GET and decrypts
+ * each chunk sequentially — only 1 S3 GET request per download.
+ */
+export async function getPresignedMultipartDownloadUrl(
+  roomId: string,
+  fileId: string,
+  expiresIn = 3600
+): Promise<string> {
+  return getSignedUrl(
+    s3,
+    new GetObjectCommand({
+      Bucket: config.S3_BUCKET,
+      Key: getMultipartKey(roomId, fileId),
+    }),
+    { expiresIn }
+  );
+}
+
+/**
+ * Delete a multipart-uploaded encrypted file (single S3 object).
+ */
+export async function deleteMultipartObject(
+  roomId: string,
+  fileId: string
+): Promise<void> {
+  await s3.send(
+    new DeleteObjectCommand({
+      Bucket: config.S3_BUCKET,
+      Key: getMultipartKey(roomId, fileId),
+    })
+  );
 }
 
 // ──────────────────────────────────────

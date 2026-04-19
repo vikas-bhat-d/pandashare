@@ -1,4 +1,4 @@
-import rateLimit from "express-rate-limit";
+import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import type { Request } from "express";
 
 // UUID v1-v5 pattern
@@ -21,7 +21,7 @@ function keyGenerator(req: Request): string {
   if (typeof id === "string" && UUID_RE.test(id.trim())) {
     return id.trim().toLowerCase();
   }
-  return req.ip ?? req.socket?.remoteAddress ?? "unknown";
+  return ipKeyGenerator(req);
 }
 
 // General API rate limiter — 200 req per device per 15 min

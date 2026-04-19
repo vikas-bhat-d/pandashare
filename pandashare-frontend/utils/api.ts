@@ -26,6 +26,8 @@ export interface FileMetadata {
   size: string; // stringified BigInt from backend
   uploadedAt: string;
   isComplete: boolean;
+  isMultipart: boolean;  // true = stored as single S3 object
+  chunkSize: number;     // plaintext chunk size used during encryption
 }
 
 // ──────────────────────────────────────
@@ -164,6 +166,46 @@ export async function completeUpload(
   });
 }
 
+/**
+ * Initiate an S3 multipart upload for an encrypted file.
+ * Returns one presigned UploadPart URL per encrypted part and the S3 uploadId.
+ * The browser PUTs each encrypted part directly to S3 and captures the ETag
+ * from the response header — no data passes through Node.
+ */
+export async function initiateMultipartUpload(
+  roomId: string,
+  fileId: string,
+  fileName: string,
+  size: number,
+  totalParts: number,
+  chunkSize: number
+): Promise<{ uploadId: string; urls: string[] }> {
+  return apiJson<{ uploadId: string; urls: string[] }>("/api/upload/multipart/initiate", {
+    method: "POST",
+    body: JSON.stringify({ roomId, fileId, fileName, size, totalParts, chunkSize }),
+  });
+}
+
+/**
+ * Complete the S3 multipart upload and save metadata to the database.
+ * parts = [{ PartNumber, ETag }] captured by the browser from each UploadPart response.
+ */
+export async function completeMultipartUpload(
+  roomId: string,
+  fileId: string,
+  fileName: string,
+  size: number,
+  totalParts: number,
+  chunkSize: number,
+  uploadId: string,
+  parts: Array<{ PartNumber: number; ETag: string }>
+): Promise<void> {
+  await apiJson("/api/upload/multipart/complete", {
+    method: "POST",
+    body: JSON.stringify({ roomId, fileId, fileName, size, totalParts, chunkSize, uploadId, parts }),
+  });
+}
+
 // ──────────────────────────────────────
 // Download API
 // ──────────────────────────────────────
@@ -199,6 +241,20 @@ export async function getPresignedUrl(
 ): Promise<string> {
   const { url } = await apiJson<{ url: string }>(`/api/files/${encodeURIComponent(roomId)}/${encodeURIComponent(fileId)}/url`);
   return url;
+}
+
+/**
+ * Request a single presigned GET URL for a multipart-uploaded encrypted file.
+ * Returns the URL plus the chunk count and chunk size needed to reconstruct IVs.
+ */
+export async function getMultipartDownloadPresignedUrl(
+  roomId: string,
+  fileId: string
+): Promise<{ url: string; totalChunks: number; chunkSize: number }> {
+  return apiJson<{ url: string; totalChunks: number; chunkSize: number }>(
+    "/api/download/multipart/presign",
+    { method: "POST", body: JSON.stringify({ roomId, fileId }) }
+  );
 }
 
 export async function deleteFile(

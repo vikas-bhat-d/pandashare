@@ -32,8 +32,8 @@ const publicCompleteSchema = z.object({
   size: z.number().positive(),
 });
 
-// Max chunks = ceil(2 GB / 5 MB) = 410. Cap at 500 to allow headroom.
-const MAX_ENCRYPTED_CHUNKS = 500;
+// Max chunks = ceil(2 GB / 20 MB) = 103. Cap at 150 to allow headroom.
+const MAX_ENCRYPTED_CHUNKS = 150;
 const CHUNK_SIZE_BYTES = 20 * 1024 * 1024; // must match frontend CHUNK_SIZE
 
 const encryptedPresignSchema = z.object({
@@ -42,6 +42,28 @@ const encryptedPresignSchema = z.object({
   fileName: z.string().min(1),
   size: z.number().positive().max(2 * 1024 * 1024 * 1024), // 2 GB hard cap
   totalChunks: z.number().int().positive().max(MAX_ENCRYPTED_CHUNKS),
+});
+
+const multipartInitSchema = z.object({
+  roomId: z.string().min(1),
+  fileId: z.string().min(1),
+  fileName: z.string().min(1),
+  size: z.number().positive().max(2 * 1024 * 1024 * 1024),
+  totalParts: z.number().int().positive().max(MAX_ENCRYPTED_CHUNKS),
+  chunkSize: z.number().int().positive(), // plaintext chunk size in bytes
+});
+
+const multipartCompleteSchema = z.object({
+  roomId: z.string().min(1),
+  fileId: z.string().min(1),
+  fileName: z.string().min(1),
+  size: z.number().positive(),
+  totalParts: z.number().int().positive(),
+  chunkSize: z.number().int().positive(),
+  uploadId: z.string().min(1),
+  parts: z
+    .array(z.object({ PartNumber: z.number().int().positive(), ETag: z.string().min(1) }))
+    .min(1),
 });
 
 // ──────────────────────────────────────
@@ -194,6 +216,88 @@ router.post(
         },
       });
     } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/**
+ * POST /api/upload/multipart/initiate
+ * Creates an S3 multipart upload and returns presigned UploadPart URLs.
+ * The browser uploads each encrypted part directly to S3 (ETag captured per part).
+ * Storing the whole file as one S3 object means download = 1 GET regardless of file size.
+ *
+ * Body: { roomId, fileId, fileName, size, totalParts, chunkSize }
+ * Response: { uploadId, urls }
+ */
+router.post(
+  "/upload/multipart/initiate",
+  validate(multipartInitSchema),
+  async (req, res, next) => {
+    try {
+      const { roomId, fileId, size, totalParts, chunkSize } =
+        req.body as z.infer<typeof multipartInitSchema>;
+
+      // Verify totalParts is consistent with declared file size and chunkSize
+      const expectedParts = Math.ceil(size / chunkSize);
+      if (totalParts !== expectedParts) {
+        return res.status(400).json({
+          error: `totalParts ${totalParts} does not match expected ${expectedParts} for size ${size} / chunkSize ${chunkSize}`,
+        });
+      }
+
+      const { uploadId, urls } = await storage.initiateMultipartUpload(
+        roomId,
+        fileId,
+        totalParts
+      );
+
+      res.json({ uploadId, urls });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/**
+ * POST /api/upload/multipart/complete
+ * Completes the S3 multipart upload by combining all parts into one object,
+ * then saves file metadata to the database.
+ *
+ * Body: { roomId, fileId, fileName, size, totalParts, chunkSize, uploadId, parts }
+ * Response: { ok, file }
+ */
+router.post(
+  "/upload/multipart/complete",
+  validate(multipartCompleteSchema),
+  async (req, res, next) => {
+    try {
+      const { roomId, fileId, fileName, size, totalParts, chunkSize, uploadId, parts } =
+        req.body as z.infer<typeof multipartCompleteSchema>;
+
+      await storage.completeMultipartUpload(roomId, fileId, uploadId, parts);
+
+      const file = await fileService.completeUpload({
+        fileId,
+        roomId,
+        fileName,
+        totalChunks: totalParts,
+        size,
+        isMultipart: true,
+        chunkSize,
+      });
+
+      res.json({
+        ok: true,
+        file: { ...file, size: file.size.toString() },
+      });
+    } catch (err) {
+      // Attempt to clean up the incomplete multipart upload so S3 doesn't
+      // keep charging for orphaned parts.
+      const body = req.body as Partial<z.infer<typeof multipartCompleteSchema>>;
+      if (body.roomId && body.fileId && body.uploadId) {
+        await storage.abortMultipartUpload(body.roomId, body.fileId, body.uploadId);
+      }
       next(err);
     }
   }

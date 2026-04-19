@@ -8,6 +8,10 @@ export interface CompleteUploadInput {
   fileName: string;
   totalChunks: number;
   size: number;
+  /** true when the encrypted file was stored as one S3 object via multipart upload */
+  isMultipart?: boolean;
+  /** plaintext chunk size used during encryption (needed to reconstruct chunk IVs on download) */
+  chunkSize?: number;
 }
 
 /**
@@ -23,6 +27,8 @@ export async function completeUpload(data: CompleteUploadInput) {
       totalChunks: data.totalChunks,
       size: BigInt(data.size),
       fileName: data.fileName,
+      isMultipart: data.isMultipart ?? false,
+      chunkSize: data.chunkSize ?? 0,
     },
     create: {
       id: data.fileId,
@@ -31,6 +37,8 @@ export async function completeUpload(data: CompleteUploadInput) {
       totalChunks: data.totalChunks,
       size: BigInt(data.size),
       isComplete: true,
+      isMultipart: data.isMultipart ?? false,
+      chunkSize: data.chunkSize ?? 0,
     },
   });
 }

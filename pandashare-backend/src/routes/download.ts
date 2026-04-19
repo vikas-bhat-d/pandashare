@@ -7,13 +7,18 @@ import * as fileService from "../services/file.service";
 const router = Router();
 
 // ── Constants (must match upload pipeline) ──────────────────────────────────
-const MAX_ENCRYPTED_CHUNKS = 500;
+const MAX_ENCRYPTED_CHUNKS = 150;
 
 // ── Schemas ──────────────────────────────────────────────────────────────────
 const encryptedDownloadPresignSchema = z.object({
   roomId: z.string().min(1).max(500),
   fileId: z.string().min(1),
   totalChunks: z.number().int().min(1).max(MAX_ENCRYPTED_CHUNKS),
+});
+
+const multipartDownloadPresignSchema = z.object({
+  roomId: z.string().min(1).max(500),
+  fileId: z.string().min(1),
 });
 
 // ──────────────────────────────────────
@@ -128,8 +133,38 @@ router.post(
 );
 
 /**
+ * POST /api/download/multipart/presign
+ * Returns a single presigned S3 GET URL for a multipart-uploaded encrypted file.
+ * The browser streams the whole object in one request, decrypting chunks on the fly.
+ * This is 1 GET instead of N GETs (one per chunk in the old approach).
+ *
+ * Body: { roomId, fileId }
+ * Response: { url, totalChunks, chunkSize }
+ */
+router.post(
+  "/download/multipart/presign",
+  validate(multipartDownloadPresignSchema),
+  async (req, res, next) => {
+    try {
+      const { roomId, fileId } = req.body as z.infer<typeof multipartDownloadPresignSchema>;
+
+      const file = await fileService.getFile(roomId, fileId);
+      if (!file || !file.isComplete || !file.isMultipart) {
+        return res.status(404).json({ error: "File not found" });
+      }
+
+      const url = await storage.getPresignedMultipartDownloadUrl(roomId, fileId);
+      res.json({ url, totalChunks: file.totalChunks, chunkSize: file.chunkSize });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/**
  * DELETE /api/files/:roomId/:fileId
- * Deletes a file: removes all S3 chunks then the DB record.
+ * Deletes a file: removes S3 object(s) then the DB record.
+ * Handles both the legacy per-chunk format and the new multipart single-object format.
  */
 router.delete("/files/:roomId/:fileId", async (req, res, next) => {
   try {
@@ -141,8 +176,11 @@ router.delete("/files/:roomId/:fileId", async (req, res, next) => {
       return res.status(404).json({ error: "File not found" });
     }
 
-    // Delete from S3 first, then from DB
-    await storage.deleteFileChunks(roomId, fileId, file.totalChunks);
+    if (file.isMultipart) {
+      await storage.deleteMultipartObject(roomId, fileId);
+    } else {
+      await storage.deleteFileChunks(roomId, fileId, file.totalChunks);
+    }
     await fileService.deleteFile(fileId);
 
     res.json({ ok: true });

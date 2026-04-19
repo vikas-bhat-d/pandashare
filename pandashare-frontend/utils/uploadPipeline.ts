@@ -1,9 +1,15 @@
 // uploadPipeline.ts — Orchestrates chunked encryption + upload
 
 import { encryptChunk, deriveKey } from "./crypto";
-import { completeUpload, getPublicUploadPresignedUrl, completePublicUpload, getEncryptedUploadPresignedUrls } from "./api";
+import {
+  completeUpload,
+  getPublicUploadPresignedUrl,
+  completePublicUpload,
+  initiateMultipartUpload,
+  completeMultipartUpload,
+} from "./api";
 
-const CHUNK_SIZE = 20 * 1024 * 1024; // 5MB
+const CHUNK_SIZE = 20 * 1024 * 1024; // 20 MB — each S3 part (must be ≥5 MB except last)
 
 /**
  * Max number of chunks to encrypt+upload concurrently for password mode.
@@ -41,16 +47,20 @@ async function runConcurrently(
 }
 
 /**
- * PUT an encrypted ArrayBuffer directly to a presigned S3 chunk URL.
- * Uses fetch (no progress needed — chunk count drives the indicator).
+ * PUT an encrypted ArrayBuffer to a presigned S3 UploadPart URL.
+ * Returns the ETag from the response header — required by CompleteMultipartUpload.
+ * S3 CORS must include `ExposeHeaders: ["ETag"]` for the browser to read it.
  */
-async function putToPresignedChunkUrl(url: string, data: ArrayBuffer): Promise<void> {
+async function putPartToPresignedUrl(url: string, data: ArrayBuffer): Promise<string> {
   const res = await fetch(url, {
     method: "PUT",
     headers: { "Content-Type": "application/octet-stream" },
     body: data,
   });
-  if (!res.ok) throw new Error(`S3 chunk upload failed: ${res.status} ${res.statusText}`);
+  if (!res.ok) throw new Error(`S3 part upload failed: ${res.status} ${res.statusText}`);
+  const etag = res.headers.get("ETag");
+  if (!etag) throw new Error("S3 did not return an ETag for the uploaded part. Ensure CORS ExposeHeaders includes ETag.");
+  return etag;
 }
 
 /**
@@ -141,10 +151,12 @@ export async function uploadFile(
     return { fileId, totalChunks: 1 };
   }
 
-  // ── Password mode: presigned per-chunk PUTs (no Node in the data path) ────
-  // Getting all presigned URLs upfront costs exactly 1 backend request.
-  // The actual bytes go directly from the browser to S3, bypassing Node
-  // entirely — no rate-limit hits, no server memory pressure.
+  // ── Password mode: S3 multipart upload (all encrypted parts → 1 S3 object) ─
+  // Upload flow:
+  //   1. Backend creates an S3 multipart upload → returns uploadId + N presigned UploadPart URLs
+  //   2. Browser encrypts each chunk and PUTs it directly to S3 → captures ETag per part
+  //   3. Browser sends ETags to backend → backend calls CompleteMultipartUpload
+  // Result: N UploadPart requests to S3, but only ONE S3 GET on download (vs N GETs before).
   const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
 
   // Derive encryption key
@@ -153,13 +165,15 @@ export async function uploadFile(
     key = await deriveKey(password, salt);
   }
 
-  // 1. Get all presigned PUT URLs in one backend call
+  // 1. Initiate multipart upload — 1 backend request returns uploadId + N presigned URLs
   onProgress?.({ phase: "encrypting", chunkIndex: 0, totalChunks, percent: 0 });
-  const { urls } = await getEncryptedUploadPresignedUrls(
-    roomId, fileId, file.name, file.size, totalChunks
+  const { uploadId, urls } = await initiateMultipartUpload(
+    roomId, fileId, file.name, file.size, totalChunks, CHUNK_SIZE
   );
 
-  // 2. Encrypt + PUT each chunk directly to S3 (up to CHUNK_CONCURRENCY at once)
+  // 2. Encrypt + PUT each part directly to S3 (up to CHUNK_CONCURRENCY at once)
+  //    Parts are 1-indexed for S3; ETags indexed by part number (0-based array).
+  const etags: string[] = new Array(totalChunks);
   let completedChunks = 0;
 
   await runConcurrently(totalChunks, CHUNK_CONCURRENCY, async (i) => {
@@ -171,8 +185,8 @@ export async function uploadFile(
       buffer = await encryptChunk(buffer, key, i, baseIV);
     }
 
-    // Direct S3 upload — no rate limit hit on the backend
-    await putToPresignedChunkUrl(urls[i], buffer);
+    // PUT directly to S3 — no rate-limit hit; capture ETag for CompleteMultipartUpload
+    etags[i] = await putPartToPresignedUrl(urls[i], buffer);
 
     completedChunks++;
     onProgress?.({
@@ -183,26 +197,15 @@ export async function uploadFile(
     });
   });
 
-  // 3. Finalize — save metadata (1 backend request)
-  onProgress?.({
-    phase: "finalizing",
-    chunkIndex: totalChunks,
-    totalChunks,
-    percent: 99,
-  });
+  // 3. Complete multipart upload — assembles all parts into 1 S3 object
+  onProgress?.({ phase: "finalizing", chunkIndex: totalChunks, totalChunks, percent: 99 });
 
-  await completeUpload(roomId, fileId, {
-    fileName: file.name,
-    totalChunks,
-    size: file.size,
-  });
+  const parts = etags.map((ETag, i) => ({ PartNumber: i + 1, ETag }));
+  await completeMultipartUpload(
+    roomId, fileId, file.name, file.size, totalChunks, CHUNK_SIZE, uploadId, parts
+  );
 
-  onProgress?.({
-    phase: "uploading",
-    chunkIndex: totalChunks,
-    totalChunks,
-    percent: 100,
-  });
+  onProgress?.({ phase: "uploading", chunkIndex: totalChunks, totalChunks, percent: 100 });
 
   return { fileId, totalChunks };
 }

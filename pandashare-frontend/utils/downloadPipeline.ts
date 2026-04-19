@@ -8,7 +8,7 @@
 // TODO: Add per-chunk retry with exponential back-off.
 
 import { decryptChunk, deriveKey } from "./crypto";
-import { getEncryptedDownloadPresignedUrls, fromBase64, getPresignedUrl } from "./api";
+import { getEncryptedDownloadPresignedUrls, fromBase64, getPresignedUrl, getMultipartDownloadPresignedUrl } from "./api";
 
 /**
  * Fetch one encrypted chunk directly from S3 via a presigned GET URL.
@@ -72,13 +72,15 @@ export async function downloadFile(
   mode: "password" | "public",
   options: {
     password?: string;
-    salt?: string;      // base64 encoded
-    baseIV?: string;    // base64 encoded
-    fileSize?: number;  // total bytes — passed to StreamSaver for accurate progress bar
+    salt?: string;        // base64 encoded
+    baseIV?: string;      // base64 encoded
+    fileSize?: number;    // total bytes — passed to StreamSaver for accurate progress bar
+    isMultipart?: boolean;  // true = file stored as single S3 object (new multipart format)
+    chunkSize?: number;     // plaintext chunk size used during encryption
     onProgress?: (progress: DownloadProgress) => void;
   } = {}
 ): Promise<void> {
-  const { password, salt, baseIV, fileSize, onProgress } = options;
+  const { password, salt, baseIV, fileSize, isMultipart, chunkSize, onProgress } = options;
 
   // ── Public mode: single presigned URL → StreamSaver ──────────────────────────
   if (mode === "public") {
@@ -122,6 +124,96 @@ export async function downloadFile(
     const saltBytes = fromBase64(salt);
     baseIVBytes = fromBase64(baseIV);
     key = await deriveKey(password, saltBytes);
+  }
+
+  // ── Multipart mode: stream single S3 object, decrypt chunk-by-chunk ──────────
+  // The whole file is one S3 GET. We read the response body as a stream and
+  // reassemble each encrypted chunk (fixed chunkSize + 16-byte AES-GCM tag),
+  // decrypt it, and pipe the plaintext to StreamSaver — 0 bytes accumulate in heap.
+  if (isMultipart && chunkSize) {
+    const { url, totalChunks: parts, chunkSize: storedChunkSize } =
+      await getMultipartDownloadPresignedUrl(roomId, fileId);
+
+    const encryptedChunkSize = storedChunkSize + 16; // AES-GCM appends 16-byte auth tag
+    const writable = await createStreamSaverWritable(fileName, fileSize);
+    const writer = writable.getWriter();
+
+    try {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`Download failed: ${response.status}`);
+
+      const reader = response.body!.getReader();
+      let partBuffer = new Uint8Array(0);
+      let partIndex = 0;
+
+      // Read the stream in arbitrary-sized network chunks.
+      // Accumulate bytes until we have a full encrypted part, then decrypt + write.
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        // Append incoming bytes to the accumulation buffer
+        const combined = new Uint8Array(partBuffer.byteLength + value.byteLength);
+        combined.set(partBuffer);
+        combined.set(value, partBuffer.byteLength);
+        partBuffer = combined;
+
+        // Drain as many complete encrypted chunks as possible
+        while (partIndex < parts && partBuffer.byteLength >= encryptedChunkSize) {
+          const isLastPart = partIndex === parts - 1;
+          // Last part may be smaller — consume all remaining bytes
+          const partLen = isLastPart ? partBuffer.byteLength : encryptedChunkSize;
+
+          const chunkBase = (partIndex / parts) * 100;
+          const chunkSlot = 100 / parts;
+
+          onProgress?.({
+            phase: "decrypting",
+            chunkIndex: partIndex,
+            totalChunks: parts,
+            percent: Math.round(chunkBase + chunkSlot * 0.5),
+          });
+
+          const encryptedPart = partBuffer.slice(0, partLen).buffer;
+          let decrypted: ArrayBuffer;
+          if (key && baseIVBytes) {
+            try {
+              decrypted = await decryptChunk(encryptedPart, key, partIndex, baseIVBytes);
+            } catch {
+              await writer.abort("Decryption failed").catch(() => {});
+              throw new Error("Decryption failed — the password may be incorrect or the data is corrupted.");
+            }
+          } else {
+            decrypted = encryptedPart;
+          }
+
+          onProgress?.({
+            phase: "writing",
+            chunkIndex: partIndex,
+            totalChunks: parts,
+            percent: Math.round(chunkBase + chunkSlot * 0.9),
+          });
+
+          await writer.write(new Uint8Array(decrypted));
+          partBuffer = partBuffer.slice(partLen);
+          partIndex++;
+
+          onProgress?.({
+            phase: "writing",
+            chunkIndex: partIndex,
+            totalChunks: parts,
+            percent: Math.round((partIndex / parts) * 100),
+          });
+        }
+      }
+
+      await writer.close();
+      onProgress?.({ phase: "writing", chunkIndex: parts, totalChunks: parts, percent: 100 });
+    } catch (err) {
+      await writer.abort(err).catch(() => {});
+      throw err;
+    }
+    return;
   }
 
   // Single request for all presigned S3 GET URLs.

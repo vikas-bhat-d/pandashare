@@ -42,6 +42,8 @@ interface FileTile {
   size: string;
   sizeBytes: number;
   totalChunks: number;
+  isMultipart: boolean;
+  chunkSize: number;
   status: "idle" | "decrypting" | "downloading" | "done" | "encrypting" | "uploading" | "error";
   progress: number;
   errorMessage?: string;
@@ -66,6 +68,8 @@ export function RoomFilesGrid({
       size: formatFileSize(Number(f.size)),
       sizeBytes: Number(f.size),
       totalChunks: f.totalChunks,
+      isMultipart: f.isMultipart,
+      chunkSize: f.chunkSize,
       status: "idle" as const,
       progress: 0,
     }))
@@ -150,6 +154,8 @@ export function RoomFilesGrid({
               size: formatFileSize(Number(f.size)),
               sizeBytes: Number(f.size),
               totalChunks: f.totalChunks,
+              isMultipart: f.isMultipart,
+              chunkSize: f.chunkSize,
               status: "idle" as const,
               progress: 0,
             }))
@@ -166,6 +172,8 @@ export function RoomFilesGrid({
               size: formatFileSize(Number(f.size)),
               sizeBytes: Number(f.size),
               totalChunks: f.totalChunks,
+              isMultipart: f.isMultipart,
+              chunkSize: f.chunkSize,
               status: "idle" as const,
               progress: 0,
             }))
@@ -195,7 +203,9 @@ export function RoomFilesGrid({
       name: f.name,
       size: formatFileSize(f.size),
       sizeBytes: f.size,
-      totalChunks: Math.ceil(f.size / (5 * 1024 * 1024)),
+      totalChunks: Math.ceil(f.size / (20 * 1024 * 1024)),
+      isMultipart: mode === "password", // new uploads always use multipart for password mode
+      chunkSize: 20 * 1024 * 1024,
       status: (mode === "password" ? "encrypting" : "uploading") as FileTile["status"],
       progress: 0,
     }));
@@ -289,6 +299,8 @@ export function RoomFilesGrid({
         salt: salt || undefined,
         baseIV: baseIV || undefined,
         fileSize: tile.sizeBytes,
+        isMultipart: tile.isMultipart,
+        chunkSize: tile.chunkSize,
         onProgress: (progress: DownloadProgress) => {
           updateTile({
             status: progress.phase === "decrypting" ? "decrypting" : "downloading",
