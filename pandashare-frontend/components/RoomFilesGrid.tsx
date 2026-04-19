@@ -288,6 +288,7 @@ export function RoomFilesGrid({
         password: actPwd,
         salt: salt || undefined,
         baseIV: baseIV || undefined,
+        fileSize: tile.sizeBytes,
         onProgress: (progress: DownloadProgress) => {
           updateTile({
             status:
