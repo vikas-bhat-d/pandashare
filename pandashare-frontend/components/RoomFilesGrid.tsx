@@ -291,12 +291,7 @@ export function RoomFilesGrid({
         fileSize: tile.sizeBytes,
         onProgress: (progress: DownloadProgress) => {
           updateTile({
-            status:
-              progress.phase === "decrypting"
-                ? "decrypting"
-                : progress.phase === "writing" || progress.phase === "assembling"
-                ? "downloading"
-                : "downloading",
+            status: progress.phase === "decrypting" ? "decrypting" : "downloading",
             progress: progress.percent,
           });
         },

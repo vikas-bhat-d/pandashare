@@ -9,13 +9,12 @@ import { config } from "../config";
 import { Readable } from "stream";
 
 const s3 = new S3Client({
-  endpoint: config.S3_ENDPOINT,
+  ...(config.S3_ENDPOINT ? { endpoint: config.S3_ENDPOINT, forcePathStyle: true } : {}),
   region: config.S3_REGION,
   credentials: {
     accessKeyId: config.S3_ACCESS_KEY,
     secretAccessKey: config.S3_SECRET_KEY,
   },
-  forcePathStyle: true, // Required for MinIO
 });
 
 // ──────────────────────────────────────

@@ -1,13 +1,11 @@
 // downloadPipeline.ts — Orchestrates chunked download + decryption
 //
-// Download strategy (in order of preference):
-//   1. File System Access API  — user picks save path; browser writes natively.
-//      Supported: Chrome 86+, Edge 86+, Chrome Android 86+.
-//   2. StreamSaver.js          — intercepts via a Service Worker; browser's own
-//      download manager writes to disk. Supported: all SW-capable browsers
-//      (Firefox, Samsung Internet, Safari 11.1+, Chrome, Edge).
+// Uses StreamSaver.js exclusively:
+//   - Intercepts via a Service Worker → browser's native download manager
+//   - No bytes accumulate in JS heap — safe for 2 GB+ files
+//   - Supported: Chrome, Edge, Firefox, Samsung Internet, Safari 11.1+
 //
-// Neither tier accumulates the file in JS heap — both are safe for 2 GB+ files.
+// TODO: Add per-chunk retry with exponential back-off.
 
 import { decryptChunk, deriveKey } from "./crypto";
 import { getEncryptedDownloadPresignedUrls, fromBase64, getPresignedUrl } from "./api";
@@ -39,7 +37,10 @@ async function createStreamSaverWritable(
   size?: number
 ): Promise<WritableStream<Uint8Array>> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const streamSaver = (await import("streamsaver")) as any;
+  const mod = (await import("streamsaver")) as any;
+  // webpack exposes CJS modules as a Module namespace object where top-level
+  // properties are read-only getters; the mutable CJS exports live on .default.
+  const streamSaver = mod.default ?? mod;
   streamSaver.mitm = "/mitm.html";
   return streamSaver.createWriteStream(
     fileName,
@@ -48,7 +49,7 @@ async function createStreamSaverWritable(
 }
 
 export interface DownloadProgress {
-  phase: "downloading" | "decrypting" | "assembling" | "writing";
+  phase: "downloading" | "decrypting" | "writing";
   chunkIndex: number;
   totalChunks: number;
   percent: number;
@@ -57,10 +58,9 @@ export interface DownloadProgress {
 /**
  * Download a file from a room with optional client-side decryption.
  *
- * Progress shares (password mode):
- *   downloadShare = 40, decryptShare = 50, writeShare = 10
- * Progress shares (public mode):
- *   Single incrementing percent based on Content-Length.
+ * Progress (password mode): per-chunk base offset ensures percent is always
+ * monotonically increasing — 40% of each chunk = download, 50% = decrypt, 10% = write.
+ * Progress (public mode): driven by Content-Length when available.
  *
  * Throws "Decryption failed" if the password is wrong (AES-GCM auth tag mismatch).
  */
@@ -74,98 +74,48 @@ export async function downloadFile(
     password?: string;
     salt?: string;      // base64 encoded
     baseIV?: string;    // base64 encoded
-    fileSize?: number;  // total bytes — passed to StreamSaver for accurate progress
+    fileSize?: number;  // total bytes — passed to StreamSaver for accurate progress bar
     onProgress?: (progress: DownloadProgress) => void;
   } = {}
 ): Promise<void> {
   const { password, salt, baseIV, fileSize, onProgress } = options;
 
-  // ── Public mode: single-object presigned URL ─────────────────────────────────
+  // ── Public mode: single presigned URL → StreamSaver ──────────────────────────
   if (mode === "public") {
     const url = await getPresignedUrl(roomId, fileId);
-    const hasFileSystemAccess = typeof window !== "undefined" && "showSaveFilePicker" in window;
-
-    // ── Tier 1: FSAPI — stream inline into a file handle ──────────────────────
-    if (hasFileSystemAccess) {
-      let fileHandle: FileSystemFileHandle;
-      try {
-        fileHandle = await (window as any).showSaveFilePicker({ // eslint-disable-line @typescript-eslint/no-explicit-any
-          suggestedName: fileName,
-          types: [{ description: "File", accept: { "application/octet-stream": [] } }],
-        });
-      } catch (err: any) { // eslint-disable-line @typescript-eslint/no-explicit-any
-        if (err?.name === "AbortError") return;
-        throw err;
-      }
-      const writable = await fileHandle.createWritable();
-      try {
-        const response = await fetch(url);
-        if (!response.ok) throw new Error(`Download failed: ${response.status}`);
-        const contentLength = parseInt(response.headers.get("Content-Length") || "0");
-        const reader = response.body!.getReader();
-        let received = 0;
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          await writable.write(value);
-          received += value.byteLength;
-          onProgress?.({
-            phase: "downloading",
-            chunkIndex: 0,
-            totalChunks: 1,
-            percent: contentLength > 0 ? Math.min(99, Math.round((received / contentLength) * 100)) : 50,
-          });
-        }
-        await writable.close();
-        onProgress?.({ phase: "writing", chunkIndex: 1, totalChunks: 1, percent: 100 });
-      } catch (err) {
-        await writable.abort().catch(() => {});
-        throw err;
-      }
-      return;
-    }
-
-    // ── Tier 2: StreamSaver — pipe presigned URL's ReadableStream straight through
-    // No bytes land in JS memory; the Service Worker hands them to the browser
-    // download manager as a streaming HTTP response.
     onProgress?.({ phase: "downloading", chunkIndex: 0, totalChunks: 1, percent: 0 });
     const writable = await createStreamSaverWritable(fileName, fileSize);
     const response = await fetch(url);
     if (!response.ok) throw new Error(`Download failed: ${response.status}`);
-
     const contentLength = parseInt(response.headers.get("Content-Length") || "0");
-    if (contentLength > 0) {
-      // With known size we can report incremental progress while piping.
-      const reader = response.body!.getReader();
-      const writer = writable.getWriter();
-      let received = 0;
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          await writer.write(value);
-          received += value.byteLength;
-          onProgress?.({
-            phase: "downloading",
-            chunkIndex: 0,
-            totalChunks: 1,
-            percent: Math.min(99, Math.round((received / contentLength) * 100)),
-          });
-        }
-        await writer.close();
-      } catch (err) {
-        await writer.abort(err).catch(() => {});
-        throw err;
+    const reader = response.body!.getReader();
+    const writer = writable.getWriter();
+    let received = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        await writer.write(value);
+        received += value.byteLength;
+        onProgress?.({
+          phase: "downloading",
+          chunkIndex: 0,
+          totalChunks: 1,
+          percent: contentLength > 0
+            ? Math.min(99, Math.round((received / contentLength) * 100))
+            : 50,
+        });
       }
-    } else {
-      // Unknown size — hand the ReadableStream straight to StreamSaver via pipeTo.
-      await response.body!.pipeTo(writable);
+      await writer.close();
+    } catch (err) {
+      await writer.abort(err).catch(() => {});
+      throw err;
     }
-    onProgress?.({ phase: "downloading", chunkIndex: 1, totalChunks: 1, percent: 100 });
+    onProgress?.({ phase: "writing", chunkIndex: 1, totalChunks: 1, percent: 100 });
     return;
   }
 
-  // ── Password mode: chunked + decrypted download ──────────────────────────────
+  // ── Password mode: chunked encrypted download → StreamSaver ─────────────────
   let key: CryptoKey | null = null;
   let baseIVBytes: Uint8Array | null = null;
   if (password && salt && baseIV) {
@@ -174,93 +124,37 @@ export async function downloadFile(
     key = await deriveKey(password, saltBytes);
   }
 
-  // Single backend request for all presigned S3 GET URLs.
+  // Single request for all presigned S3 GET URLs.
   const { urls } = await getEncryptedDownloadPresignedUrls(roomId, fileId, totalChunks);
 
-  const downloadShare = 40;
-  const decryptShare  = 50;
-  const writeShare    = 10; // 100 - 40 - 50
-
-  // ── Tier 1: File System Access API ──────────────────────────────────────────
-  const hasFileSystemAccess = typeof window !== "undefined" && "showSaveFilePicker" in window;
-
-  if (hasFileSystemAccess) {
-    let fileHandle: FileSystemFileHandle;
-    try {
-      fileHandle = await (window as any).showSaveFilePicker({ // eslint-disable-line @typescript-eslint/no-explicit-any
-        suggestedName: fileName,
-        types: [{ description: "File", accept: { "application/octet-stream": [] } }],
-      });
-    } catch (err: any) { // eslint-disable-line @typescript-eslint/no-explicit-any
-      if (err?.name === "AbortError") return;
-      throw err;
-    }
-    const writable = await fileHandle.createWritable();
-    try {
-      // Double-buffer: fetch chunk i+1 while decrypting chunk i.
-      let prefetch: Promise<ArrayBuffer> | null = null;
-      for (let i = 0; i < totalChunks; i++) {
-        onProgress?.({
-          phase: "downloading",
-          chunkIndex: i,
-          totalChunks,
-          percent: Math.round(((i + 0.5) / totalChunks) * downloadShare),
-        });
-        const buffer = prefetch ? await prefetch : await fetchChunkFromUrl(urls[i]);
-        prefetch = null;
-        if (i + 1 < totalChunks) prefetch = fetchChunkFromUrl(urls[i + 1]);
-
-        if (key && baseIVBytes) {
-          onProgress?.({
-            phase: "decrypting",
-            chunkIndex: i,
-            totalChunks,
-            percent: downloadShare + Math.round(((i + 0.5) / totalChunks) * decryptShare),
-          });
-          let decrypted: ArrayBuffer;
-          try {
-            decrypted = await decryptChunk(buffer, key, i, baseIVBytes);
-          } catch {
-            await writable.abort();
-            throw new Error("Decryption failed — the password may be incorrect or the data is corrupted.");
-          }
-          onProgress?.({
-            phase: "writing",
-            chunkIndex: i,
-            totalChunks,
-            percent: downloadShare + decryptShare + Math.round(((i + 0.5) / totalChunks) * writeShare),
-          });
-          await writable.write(decrypted);
-        }
-      }
-      await writable.close();
-      onProgress?.({ phase: "writing", chunkIndex: totalChunks, totalChunks, percent: 100 });
-    } catch (err) {
-      await writable.abort().catch(() => {});
-      throw err;
-    }
-    return;
-  }
-
-  // ── Tier 2: StreamSaver.js ────────────────────────────────────────────────────
-  // Each decrypted chunk is written to a StreamSaver WritableStream one at a time.
-  // The Service Worker intercepts the writes and delivers them to the browser's
-  // native download manager — nothing accumulates in JS heap, safe for 2 GB+.
   const writable = await createStreamSaverWritable(fileName, fileSize);
   const writer = writable.getWriter();
   try {
-    // Double-buffer: fetch chunk i+1 while decrypting chunk i.
+    // Double-buffer: fetch chunk i+1 while decrypting/writing chunk i.
     let prefetch: Promise<ArrayBuffer> | null = null;
     for (let i = 0; i < totalChunks; i++) {
+      // Per-chunk base ensures percent is always monotonically increasing.
+      // Each chunk owns (100 / totalChunks)% of the bar, split: 40 download / 50 decrypt / 10 write.
+      const chunkBase = (i / totalChunks) * 100;
+      const chunkSize = 100 / totalChunks;
+
       onProgress?.({
         phase: "downloading",
         chunkIndex: i,
         totalChunks,
-        percent: Math.round(((i + 0.5) / totalChunks) * downloadShare),
+        percent: Math.round(chunkBase + chunkSize * 0.1),
       });
+
       const buffer = prefetch ? await prefetch : await fetchChunkFromUrl(urls[i]);
       prefetch = null;
       if (i + 1 < totalChunks) prefetch = fetchChunkFromUrl(urls[i + 1]);
+
+      onProgress?.({
+        phase: "downloading",
+        chunkIndex: i,
+        totalChunks,
+        percent: Math.round(chunkBase + chunkSize * 0.4),
+      });
 
       let decrypted = buffer;
       if (key && baseIVBytes) {
@@ -268,7 +162,7 @@ export async function downloadFile(
           phase: "decrypting",
           chunkIndex: i,
           totalChunks,
-          percent: downloadShare + Math.round(((i + 0.5) / totalChunks) * decryptShare),
+          percent: Math.round(chunkBase + chunkSize * 0.5),
         });
         try {
           decrypted = await decryptChunk(buffer, key, i, baseIVBytes);
@@ -276,16 +170,29 @@ export async function downloadFile(
           await writer.abort("Decryption failed").catch(() => {});
           throw new Error("Decryption failed — the password may be incorrect or the data is corrupted.");
         }
+        onProgress?.({
+          phase: "decrypting",
+          chunkIndex: i,
+          totalChunks,
+          percent: Math.round(chunkBase + chunkSize * 0.9),
+        });
       }
 
       onProgress?.({
         phase: "writing",
         chunkIndex: i,
         totalChunks,
-        percent: downloadShare + decryptShare + Math.round(((i + 0.5) / totalChunks) * writeShare),
+        percent: Math.round(chunkBase + chunkSize * 0.9),
       });
-      // StreamSaver's writer expects Uint8Array, not ArrayBuffer
+      // StreamSaver writer expects Uint8Array, not ArrayBuffer
       await writer.write(new Uint8Array(decrypted));
+
+      onProgress?.({
+        phase: "writing",
+        chunkIndex: i,
+        totalChunks,
+        percent: Math.round(chunkBase + chunkSize),
+      });
     }
     await writer.close();
     onProgress?.({ phase: "writing", chunkIndex: totalChunks, totalChunks, percent: 100 });
