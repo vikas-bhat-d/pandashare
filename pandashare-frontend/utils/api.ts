@@ -206,6 +206,26 @@ export async function completeMultipartUpload(
   });
 }
 
+/**
+ * Abort an in-progress S3 multipart upload.
+ * Called on user cancellation to free orphaned parts and stop S3 billing for them.
+ * Fire-and-forget safe — failure is swallowed so it never surfaces to the user.
+ */
+export async function abortMultipartUpload(
+  roomId: string,
+  fileId: string,
+  uploadId: string
+): Promise<void> {
+  try {
+    await apiJson("/api/upload/multipart/abort", {
+      method: "POST",
+      body: JSON.stringify({ roomId, fileId, uploadId }),
+    });
+  } catch {
+    // best-effort — S3 also expires incomplete multipart uploads via lifecycle rules
+  }
+}
+
 // ──────────────────────────────────────
 // Download API
 // ──────────────────────────────────────

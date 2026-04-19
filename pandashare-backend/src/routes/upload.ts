@@ -53,6 +53,12 @@ const multipartInitSchema = z.object({
   chunkSize: z.number().int().positive(), // plaintext chunk size in bytes
 });
 
+const multipartAbortSchema = z.object({
+  roomId: z.string().min(1),
+  fileId: z.string().min(1),
+  uploadId: z.string().min(1),
+});
+
 const multipartCompleteSchema = z.object({
   roomId: z.string().min(1),
   fileId: z.string().min(1),
@@ -298,6 +304,28 @@ router.post(
       if (body.roomId && body.fileId && body.uploadId) {
         await storage.abortMultipartUpload(body.roomId, body.fileId, body.uploadId);
       }
+      next(err);
+    }
+  }
+);
+
+/**
+ * POST /api/upload/multipart/abort
+ * Aborts an in-progress S3 multipart upload and frees all uploaded parts.
+ * Called by the browser when the user cancels an upload mid-flight.
+ *
+ * Body: { roomId, fileId, uploadId }
+ * Response: { ok: true }
+ */
+router.post(
+  "/upload/multipart/abort",
+  validate(multipartAbortSchema),
+  async (req, res, next) => {
+    try {
+      const { roomId, fileId, uploadId } = req.body as z.infer<typeof multipartAbortSchema>;
+      await storage.abortMultipartUpload(roomId, fileId, uploadId);
+      res.json({ ok: true });
+    } catch (err) {
       next(err);
     }
   }

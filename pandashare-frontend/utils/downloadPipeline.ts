@@ -9,13 +9,14 @@
 
 import { decryptChunk, deriveKey } from "./crypto";
 import { getEncryptedDownloadPresignedUrls, fromBase64, getPresignedUrl, getMultipartDownloadPresignedUrl } from "./api";
+import { CancelledError } from "./uploadPipeline";
 
 /**
  * Fetch one encrypted chunk directly from S3 via a presigned GET URL.
  * Bypasses the Node server — no rate-limit hits per chunk.
  */
-async function fetchChunkFromUrl(url: string): Promise<ArrayBuffer> {
-  const res = await fetch(url);
+async function fetchChunkFromUrl(url: string, signal?: AbortSignal): Promise<ArrayBuffer> {
+  const res = await fetch(url, { signal });
   if (!res.ok) throw new Error(`S3 chunk fetch failed: ${res.status} ${res.statusText}`);
   return res.arrayBuffer();
 }
@@ -77,10 +78,15 @@ export async function downloadFile(
     fileSize?: number;    // total bytes — passed to StreamSaver for accurate progress bar
     isMultipart?: boolean;  // true = file stored as single S3 object (new multipart format)
     chunkSize?: number;     // plaintext chunk size used during encryption
+    signal?: AbortSignal;   // caller-supplied AbortSignal for cancellation
     onProgress?: (progress: DownloadProgress) => void;
   } = {}
 ): Promise<void> {
-  const { password, salt, baseIV, fileSize, isMultipart, chunkSize, onProgress } = options;
+  const { password, salt, baseIV, fileSize, isMultipart, chunkSize, signal, onProgress } = options;
+
+  function throwIfCancelled() {
+    if (signal?.aborted) throw new CancelledError();
+  }
 
   // ── Public mode: single presigned URL → StreamSaver ──────────────────────────
   if (mode === "public") {
@@ -131,6 +137,7 @@ export async function downloadFile(
   // reassemble each encrypted chunk (fixed chunkSize + 16-byte AES-GCM tag),
   // decrypt it, and pipe the plaintext to StreamSaver — 0 bytes accumulate in heap.
   if (isMultipart && chunkSize) {
+    throwIfCancelled();
     const { url, totalChunks: parts, chunkSize: storedChunkSize } =
       await getMultipartDownloadPresignedUrl(roomId, fileId);
 
@@ -139,7 +146,8 @@ export async function downloadFile(
     const writer = writable.getWriter();
 
     try {
-      const response = await fetch(url);
+      throwIfCancelled();
+      const response = await fetch(url, { signal });
       if (!response.ok) throw new Error(`Download failed: ${response.status}`);
 
       const reader = response.body!.getReader();
@@ -149,6 +157,7 @@ export async function downloadFile(
       // Read the stream in arbitrary-sized network chunks.
       // Accumulate bytes until we have a full encrypted part, then decrypt + write.
       while (true) {
+        throwIfCancelled();
         const { done, value } = await reader.read();
         if (done) break;
 
@@ -211,12 +220,14 @@ export async function downloadFile(
       onProgress?.({ phase: "writing", chunkIndex: parts, totalChunks: parts, percent: 100 });
     } catch (err) {
       await writer.abort(err).catch(() => {});
+      if (err instanceof Error && err.name === "AbortError") throw new CancelledError();
       throw err;
     }
     return;
   }
 
   // Single request for all presigned S3 GET URLs.
+  throwIfCancelled();
   const { urls } = await getEncryptedDownloadPresignedUrls(roomId, fileId, totalChunks);
 
   const writable = await createStreamSaverWritable(fileName, fileSize);
@@ -225,6 +236,7 @@ export async function downloadFile(
     // Double-buffer: fetch chunk i+1 while decrypting/writing chunk i.
     let prefetch: Promise<ArrayBuffer> | null = null;
     for (let i = 0; i < totalChunks; i++) {
+      throwIfCancelled();
       // Per-chunk base ensures percent is always monotonically increasing.
       // Each chunk owns (100 / totalChunks)% of the bar, split: 40 download / 50 decrypt / 10 write.
       const chunkBase = (i / totalChunks) * 100;
@@ -237,9 +249,9 @@ export async function downloadFile(
         percent: Math.round(chunkBase + chunkSize * 0.1),
       });
 
-      const buffer = prefetch ? await prefetch : await fetchChunkFromUrl(urls[i]);
+      const buffer = prefetch ? await prefetch : await fetchChunkFromUrl(urls[i], signal);
       prefetch = null;
-      if (i + 1 < totalChunks) prefetch = fetchChunkFromUrl(urls[i + 1]);
+      if (i + 1 < totalChunks) prefetch = fetchChunkFromUrl(urls[i + 1], signal);
 
       onProgress?.({
         phase: "downloading",
@@ -290,6 +302,7 @@ export async function downloadFile(
     onProgress?.({ phase: "writing", chunkIndex: totalChunks, totalChunks, percent: 100 });
   } catch (err) {
     await writer.abort(err).catch(() => {});
+    if (err instanceof Error && err.name === "AbortError") throw new CancelledError();
     throw err;
   }
 }

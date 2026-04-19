@@ -49,14 +49,10 @@ export async function encryptChunk(
   chunkIndex: number,
   baseIV: Uint8Array
 ): Promise<ArrayBuffer> {
-  // Compute iv per chunk: baseIV conceptually + chunkIndex?
-  // We can just inject the chunkIndex into the last 4 bytes of the baseIV for simplicity.
   const iv = new Uint8Array(12);
   iv.set(baseIV);
-  
-  // Create a data view to manipulate bytes easily
+
   const view = new DataView(getArrayBufferFromUint8Array(iv));
-  // Add chunkIndex to the last 4 bytes without overflowing
   const currentChunkBytes = view.getUint32(8);
   view.setUint32(8, currentChunkBytes + chunkIndex);
 
@@ -81,7 +77,7 @@ export async function decryptChunk(
 ): Promise<ArrayBuffer> {
   const iv = new Uint8Array(12);
   iv.set(baseIV);
-  
+
   const view = new DataView(getArrayBufferFromUint8Array(iv));
   const currentChunkBytes = view.getUint32(8);
   view.setUint32(8, currentChunkBytes + chunkIndex);

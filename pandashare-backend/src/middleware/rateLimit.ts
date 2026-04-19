@@ -21,7 +21,8 @@ function keyGenerator(req: Request): string {
   if (typeof id === "string" && UUID_RE.test(id.trim())) {
     return id.trim().toLowerCase();
   }
-  return ipKeyGenerator(req);
+  const ip = req.ip ?? req.socket?.remoteAddress ?? "unknown";
+  return ipKeyGenerator(ip);
 }
 
 // General API rate limiter — 200 req per device per 15 min

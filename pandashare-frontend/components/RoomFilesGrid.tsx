@@ -11,9 +11,10 @@ import {
   AlertCircle,
   Trash2,
   FolderOpen,
+  X,
 } from "lucide-react";
 import { toast } from "sonner";
-import { uploadFile, UploadProgress } from "@/utils/uploadPipeline";
+import { uploadFile, UploadProgress, CancelledError } from "@/utils/uploadPipeline";
 import { downloadFile, DownloadProgress } from "@/utils/downloadPipeline";
 import {
   deleteFile as apiDeleteFile,
@@ -22,6 +23,7 @@ import {
   fromBase64,
 } from "@/utils/api";
 import { computeVerifier } from "@/utils/crypto";
+import { generateUUID } from "@/utils/utils";
 
 interface RoomFilesGridProps {
   roomId: string;
@@ -44,7 +46,7 @@ interface FileTile {
   totalChunks: number;
   isMultipart: boolean;
   chunkSize: number;
-  status: "idle" | "decrypting" | "downloading" | "done" | "encrypting" | "uploading" | "error";
+  status: "idle" | "decrypting" | "downloading" | "done" | "encrypting" | "uploading" | "error" | "cancelled";
   progress: number;
   errorMessage?: string;
 }
@@ -76,6 +78,8 @@ export function RoomFilesGrid({
   );
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [isDragOver, setIsDragOver] = useState(false);
+  // AbortController per active tile — keyed by tileId
+  const abortControllers = useRef<Map<string, AbortController>>(new Map());
 
   function formatFileSize(bytes: number): string {
     if (bytes === 0) return "0 B";
@@ -199,7 +203,7 @@ export function RoomFilesGrid({
   const actualProcessFiles = (rawFiles: File[], currentPassword: string) => {
     const newTiles: FileTile[] = rawFiles.map((f) => ({
       type: "file" as const,
-      id: crypto.randomUUID(),
+      id: generateUUID(),
       name: f.name,
       size: formatFileSize(f.size),
       sizeBytes: f.size,
@@ -220,6 +224,9 @@ export function RoomFilesGrid({
   };
 
   const startUpload = async (rawFile: File, tileId: string, currentPassword?: string) => {
+    const controller = new AbortController();
+    abortControllers.current.set(tileId, controller);
+
     const updateTile = (updates: Partial<FileTile>) => {
       setFiles((prev) =>
         prev.map((t) => (t.id === tileId ? { ...t, ...updates } : t))
@@ -238,6 +245,7 @@ export function RoomFilesGrid({
         salt: saltBytes,
         baseIV: ivBytes,
         fileId: tileId,
+        signal: controller.signal,
         onProgress: (progress: UploadProgress) => {
           updateTile({
             status: progress.phase === "encrypting" ? "encrypting" : "uploading",
@@ -246,6 +254,7 @@ export function RoomFilesGrid({
         },
       });
 
+      abortControllers.current.delete(tileId);
       // Success — refresh list from server to ensure consistent state
       updateTile({ status: "done", progress: 100, totalChunks: result.totalChunks });
       toast.success(`${rawFile.name} uploaded successfully`);
@@ -254,13 +263,16 @@ export function RoomFilesGrid({
         await refreshFileList();
       }, 1500);
     } catch (err) {
+      abortControllers.current.delete(tileId);
+      if (err instanceof CancelledError) {
+        // Remove the tile — the upload never completed so there's nothing to keep
+        setFiles((prev) => prev.filter((t) => t.id !== tileId));
+        toast.info(`${rawFile.name} upload cancelled`);
+        return;
+      }
       console.error("Upload failed:", err);
       const msg = err instanceof Error ? err.message : "Upload failed";
-      updateTile({
-        status: "error",
-        progress: 0,
-        errorMessage: msg,
-      });
+      updateTile({ status: "error", progress: 0, errorMessage: msg });
       toast.error(`Upload failed: ${msg}`);
     }
   };
@@ -285,6 +297,9 @@ export function RoomFilesGrid({
     const tile = files.find((f) => f.id === fileId);
     if (!tile) return;
 
+    const controller = new AbortController();
+    abortControllers.current.set(fileId, controller);
+
     const updateTile = (updates: Partial<FileTile>) => {
       setFiles((prev) =>
         prev.map((f) => (f.id === fileId ? { ...f, ...updates } : f))
@@ -301,6 +316,7 @@ export function RoomFilesGrid({
         fileSize: tile.sizeBytes,
         isMultipart: tile.isMultipart,
         chunkSize: tile.chunkSize,
+        signal: controller.signal,
         onProgress: (progress: DownloadProgress) => {
           updateTile({
             status: progress.phase === "decrypting" ? "decrypting" : "downloading",
@@ -309,15 +325,21 @@ export function RoomFilesGrid({
         },
       });
 
+      abortControllers.current.delete(fileId);
       updateTile({ status: "done", progress: 100 });
       toast.success(`${tile.name} downloaded successfully`);
       setTimeout(() => updateTile({ status: "idle", progress: 0 }), 2000);
     } catch (err) {
+      abortControllers.current.delete(fileId);
+      if (err instanceof CancelledError) {
+        updateTile({ status: "idle", progress: 0 });
+        toast.info(`${tile.name} download cancelled`);
+        return;
+      }
       console.error("Download failed:", err);
       const msg = err instanceof Error ? err.message : "Download failed";
 
       if (msg.includes("Decryption failed")) {
-        // Wrong password — show prompt again
         setDecryptionError(msg);
         toast.error("Decryption failed. Incorrect password?");
         setPasswordPromptFile(fileId);
@@ -327,6 +349,11 @@ export function RoomFilesGrid({
         toast.error(`Download failed: ${msg}`);
       }
     }
+  };
+
+  const handleCancel = (tileId: string) => {
+    const controller = abortControllers.current.get(tileId);
+    if (controller) controller.abort();
   };
 
   const handleDeleteFile = (fileId: string) => {
@@ -383,22 +410,20 @@ export function RoomFilesGrid({
 
   const getStatusLabel = (status: FileTile["status"]) => {
     switch (status) {
-      case "encrypting":
-        return "ENCRYPTING";
-      case "uploading":
-        return "UPLOADING";
-      case "decrypting":
-        return "DECRYPTING";
-      case "downloading":
-        return "DOWNLOADING";
-      case "error":
-        return "ERROR";
-      case "done":
-        return "COMPLETE";
-      default:
-        return "";
+      case "encrypting":  return "ENCRYPTING";
+      case "uploading":   return "UPLOADING";
+      case "decrypting":  return "DECRYPTING";
+      case "downloading": return "DOWNLOADING";
+      case "error":       return "ERROR";
+      case "done":        return "COMPLETE";
+      case "cancelled":   return "CANCELLED";
+      default:            return "";
     }
   };
+
+  const isActiveTransfer = (status: FileTile["status"]) =>
+    status === "uploading" || status === "downloading" ||
+    status === "encrypting" || status === "decrypting";
 
   // ── Render ────────────────────────────
 
@@ -511,9 +536,20 @@ export function RoomFilesGrid({
                 </div>
               ) : (
                 <div className="space-y-2">
-                  <div className="flex justify-between text-[10px] text-[#a1a1aa] uppercase tracking-widest font-semibold">
+                  <div className="flex items-center justify-between text-[10px] text-[#a1a1aa] uppercase tracking-widest font-semibold">
                     <span>{getStatusLabel(f.status)}</span>
-                    <span>{f.progress}%</span>
+                    <div className="flex items-center gap-2">
+                      <span>{f.progress}%</span>
+                      {isActiveTransfer(f.status) && (
+                        <button
+                          onClick={() => handleCancel(f.id)}
+                          title="Cancel transfer"
+                          className="text-[#a1a1aa] hover:text-red-400 transition-colors"
+                        >
+                          <X size={12} />
+                        </button>
+                      )}
+                    </div>
                   </div>
                   <div className="w-full bg-white/10 rounded-sm h-1.5 overflow-hidden">
                     <div

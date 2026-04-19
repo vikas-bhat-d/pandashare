@@ -1,5 +1,7 @@
 // apiClient.ts — Centralized HTTP client for PandaShare API
 
+import { generateUUID } from "./utils";
+
 const BASE_URL = typeof window !== "undefined"
   ? (process.env.NEXT_PUBLIC_API_URL || "http://localhost:4000")
   : "http://localhost:4000";
@@ -21,7 +23,7 @@ function getDeviceId(): string {
   const KEY = "ps_device_id";
   let id = localStorage.getItem(KEY);
   if (!id || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) {
-    id = crypto.randomUUID();
+    id = generateUUID();
     localStorage.setItem(KEY, id);
   }
   return id;

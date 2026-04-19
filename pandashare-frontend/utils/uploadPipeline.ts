@@ -1,15 +1,25 @@
 // uploadPipeline.ts — Orchestrates chunked encryption + upload
 
 import { encryptChunk, deriveKey } from "./crypto";
+import { generateUUID } from "./utils";
 import {
   completeUpload,
   getPublicUploadPresignedUrl,
   completePublicUpload,
   initiateMultipartUpload,
   completeMultipartUpload,
+  abortMultipartUpload,
 } from "./api";
 
 const CHUNK_SIZE = 20 * 1024 * 1024; // 20 MB — each S3 part (must be ≥5 MB except last)
+
+/** Thrown when the user cancels an upload or download. */
+export class CancelledError extends Error {
+  constructor() {
+    super("Cancelled");
+    this.name = "CancelledError";
+  }
+}
 
 /**
  * Max number of chunks to encrypt+upload concurrently for password mode.
@@ -17,6 +27,107 @@ const CHUNK_SIZE = 20 * 1024 * 1024; // 20 MB — each S3 part (must be ≥5 MB 
  * hammering the server or exhausting the rate limit.
  */
 const CHUNK_CONCURRENCY = 3;
+
+// ── Crypto Worker ─────────────────────────────────────────────────────────────
+// Encryption is CPU-bound (AES-GCM on 20 MB buffers). Doing it on the main
+// thread blocks React renders and causes visible jank. A Web Worker runs on a
+// separate OS thread, and ArrayBuffer transfers are zero-copy in both directions.
+
+interface CryptoEncryptor {
+  /** Encrypt one chunk. `buffer` is TRANSFERRED — caller must not use it after this call. */
+  encrypt(chunkIndex: number, buffer: ArrayBuffer): Promise<ArrayBuffer>;
+  /** Terminate the worker immediately (call on success AND failure). */
+  terminate(): void;
+}
+
+function createWorkerEncryptor(
+  password: string,
+  salt: Uint8Array,
+  baseIV: Uint8Array
+): Promise<CryptoEncryptor> {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL("./crypto.worker.ts", import.meta.url));
+    const pending = new Map<number, { res: (b: ArrayBuffer) => void; rej: (e: Error) => void }>();
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    worker.onmessage = ({ data }: MessageEvent<any>) => {
+      if (data.type === "ready") {
+        resolve({
+          encrypt(idx, buf) {
+            return new Promise((res, rej) => {
+              pending.set(idx, { res, rej });
+              // Transfer buf to the worker — zero-copy, main thread loses the reference
+              worker.postMessage({ type: "encrypt", id: idx, buffer: buf, chunkIndex: idx }, [buf]);
+            });
+          },
+          terminate() { worker.terminate(); },
+        });
+      } else if (data.type === "done") {
+        pending.get(data.id)?.res(data.buffer as ArrayBuffer);
+        pending.delete(data.id);
+      } else if (data.type === "error") {
+        const err = new Error((data.message as string) ?? "Crypto worker error");
+        if (data.id !== undefined) {
+          pending.get(data.id)?.rej(err);
+          pending.delete(data.id);
+        } else {
+          reject(err);
+        }
+      }
+    };
+
+    worker.onerror = (e) => reject(new Error(`Crypto worker failed: ${e.message}`));
+
+    // Copy the typed array data into plain ArrayBuffers before sending
+    // (typed arrays may be offset views into a larger buffer)
+    const saltBuf = salt.buffer.slice(salt.byteOffset, salt.byteOffset + salt.byteLength);
+    const ivBuf   = baseIV.buffer.slice(baseIV.byteOffset, baseIV.byteOffset + baseIV.byteLength);
+    worker.postMessage({ type: "init", password, salt: saltBuf, baseIV: ivBuf });
+  });
+}
+
+/**
+ * Returns a CryptoEncryptor backed by a Web Worker when available,
+ * falling back to main-thread crypto for SSR / unsupported environments.
+ */
+async function makeCryptoEncryptor(
+  password: string,
+  salt: Uint8Array,
+  baseIV: Uint8Array
+): Promise<CryptoEncryptor> {
+  if (typeof Worker !== "undefined") {
+    try {
+      return await createWorkerEncryptor(password, salt, baseIV);
+    } catch {
+      // Worker unavailable — fall through to main-thread fallback
+    }
+  }
+  // Fallback: derive key on main thread
+  const key = await deriveKey(password, salt);
+  return {
+    encrypt: (idx, buf) => encryptChunk(buf, key, idx, baseIV),
+    terminate: () => {},
+  };
+}
+
+// ── Progress Throttle ─────────────────────────────────────────────────────────
+// Limit React setState calls. The XHR upload.onprogress fires every ~64 KB;
+// for a 20 MB chunk that's ~320 events. Throttling to ≤8 fps keeps the
+// progress bar smooth while drastically reducing render pressure.
+// 0% and ≥99% always pass through so start/end are always reflected.
+function makeProgressEmitter(
+  cb?: (p: UploadProgress) => void
+): (p: UploadProgress) => void {
+  if (!cb) return () => {};
+  let lastMs = 0;
+  return (p: UploadProgress) => {
+    const now = Date.now();
+    if (p.percent === 0 || p.percent >= 99 || now - lastMs >= 120) {
+      lastMs = now;
+      cb(p);
+    }
+  };
+}
 
 export interface UploadProgress {
   phase: "encrypting" | "uploading" | "finalizing";
@@ -51,11 +162,12 @@ async function runConcurrently(
  * Returns the ETag from the response header — required by CompleteMultipartUpload.
  * S3 CORS must include `ExposeHeaders: ["ETag"]` for the browser to read it.
  */
-async function putPartToPresignedUrl(url: string, data: ArrayBuffer): Promise<string> {
+async function putPartToPresignedUrl(url: string, data: ArrayBuffer, signal?: AbortSignal): Promise<string> {
   const res = await fetch(url, {
     method: "PUT",
     headers: { "Content-Type": "application/octet-stream" },
     body: data,
+    signal,
   });
   if (!res.ok) throw new Error(`S3 part upload failed: ${res.status} ${res.statusText}`);
   const etag = res.headers.get("ETag");
@@ -70,12 +182,22 @@ async function putPartToPresignedUrl(url: string, data: ArrayBuffer): Promise<st
 function putToPresignedUrl(
   url: string,
   file: File,
-  onProgress?: (progress: UploadProgress) => void
+  onProgress?: (progress: UploadProgress) => void,
+  signal?: AbortSignal
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("PUT", url);
     xhr.setRequestHeader("Content-Type", "application/octet-stream");
+
+    // Forward AbortSignal to the XHR
+    if (signal) {
+      if (signal.aborted) {
+        reject(new CancelledError());
+        return;
+      }
+      signal.addEventListener("abort", () => xhr.abort(), { once: true });
+    }
 
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable) {
@@ -98,7 +220,7 @@ function putToPresignedUrl(
     };
 
     xhr.onerror = () => reject(new Error("S3 upload failed: network error"));
-    xhr.onabort = () => reject(new Error("S3 upload aborted"));
+    xhr.onabort = () => reject(new CancelledError());
 
     xhr.send(file);
   });
@@ -128,25 +250,37 @@ export async function uploadFile(
     salt?: Uint8Array;
     baseIV?: Uint8Array;
     fileId?: string;
+    signal?: AbortSignal;  // caller-supplied AbortSignal for cancellation
     onProgress?: (progress: UploadProgress) => void;
   } = {}
 ): Promise<{ fileId: string; totalChunks: number }> {
-  const { password, salt, baseIV, onProgress } = options;
-  const fileId = options.fileId || crypto.randomUUID();
+  const { password, salt, baseIV, signal, onProgress } = options;
+  const fileId = options.fileId || generateUUID();
+
+  // Throttled emitter — reduces React setState calls without losing start/end accuracy
+  const emit = makeProgressEmitter(onProgress);
+
+  // Helper: throw CancelledError if signal is already aborted
+  function throwIfCancelled() {
+    if (signal?.aborted) throw new CancelledError();
+  }
 
   // ── Public mode: presigned S3 PUT (no encryption, no Node buffering) ────────
   if (mode === "public") {
     // 1. Get presigned PUT URL from backend
-    onProgress?.({ phase: "uploading", chunkIndex: 0, totalChunks: 1, percent: 0 });
+    throwIfCancelled();
+    emit({ phase: "uploading", chunkIndex: 0, totalChunks: 1, percent: 0 });
     const { url } = await getPublicUploadPresignedUrl(roomId, fileId, file.name, file.size);
 
     // 2. PUT directly to S3 with real progress tracking
-    await putToPresignedUrl(url, file, onProgress);
+    throwIfCancelled();
+    await putToPresignedUrl(url, file, emit, signal);
 
     // 3. Save metadata to DB
-    onProgress?.({ phase: "finalizing", chunkIndex: 1, totalChunks: 1, percent: 99 });
+    throwIfCancelled();
+    emit({ phase: "finalizing", chunkIndex: 1, totalChunks: 1, percent: 99 });
     await completePublicUpload(roomId, fileId, file.name, file.size);
-    onProgress?.({ phase: "uploading", chunkIndex: 1, totalChunks: 1, percent: 100 });
+    emit({ phase: "uploading", chunkIndex: 1, totalChunks: 1, percent: 100 });
 
     return { fileId, totalChunks: 1 };
   }
@@ -159,53 +293,70 @@ export async function uploadFile(
   // Result: N UploadPart requests to S3, but only ONE S3 GET on download (vs N GETs before).
   const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
 
-  // Derive encryption key
-  let key: CryptoKey | null = null;
-  if (password && salt) {
-    key = await deriveKey(password, salt);
-  }
-
-  // 1. Initiate multipart upload — 1 backend request returns uploadId + N presigned URLs
-  onProgress?.({ phase: "encrypting", chunkIndex: 0, totalChunks, percent: 0 });
-  const { uploadId, urls } = await initiateMultipartUpload(
-    roomId, fileId, file.name, file.size, totalChunks, CHUNK_SIZE
-  );
+  // Create the crypto encryptor — if Worker is available, PBKDF2 key derivation
+  // and AES-GCM encryption run on a separate OS thread, keeping the main thread free.
+  // Parallelise with initiateMultipartUpload so the ~150 ms PBKDF2 cost is hidden.
+  const [encryptor, { uploadId, urls }] = await Promise.all([
+    (password && salt && baseIV)
+      ? makeCryptoEncryptor(password, salt, baseIV)
+      : Promise.resolve(null as CryptoEncryptor | null),
+    // 1. Initiate multipart upload — 1 backend request returns uploadId + N presigned URLs
+    (throwIfCancelled(),
+     emit({ phase: "encrypting", chunkIndex: 0, totalChunks, percent: 0 }),
+     initiateMultipartUpload(roomId, fileId, file.name, file.size, totalChunks, CHUNK_SIZE)),
+  ]);
 
   // 2. Encrypt + PUT each part directly to S3 (up to CHUNK_CONCURRENCY at once)
   //    Parts are 1-indexed for S3; ETags indexed by part number (0-based array).
   const etags: string[] = new Array(totalChunks);
   let completedChunks = 0;
 
-  await runConcurrently(totalChunks, CHUNK_CONCURRENCY, async (i) => {
-    const start = i * CHUNK_SIZE;
-    const end = Math.min(start + CHUNK_SIZE, file.size);
-    let buffer = await file.slice(start, end).arrayBuffer();
+  try {
+    await runConcurrently(totalChunks, CHUNK_CONCURRENCY, async (i) => {
+      throwIfCancelled();
+      const start = i * CHUNK_SIZE;
+      const end = Math.min(start + CHUNK_SIZE, file.size);
+      // Read the raw chunk; transfer it to the worker (zero-copy) if encrypting
+      let buffer = await file.slice(start, end).arrayBuffer();
+      throwIfCancelled();
 
-    if (key && baseIV) {
-      buffer = await encryptChunk(buffer, key, i, baseIV);
-    }
+      if (encryptor) {
+        // Worker encrypts off the main thread; buffer is transferred (zero-copy)
+        buffer = await encryptor.encrypt(i, buffer);
+      }
+      throwIfCancelled();
 
-    // PUT directly to S3 — no rate-limit hit; capture ETag for CompleteMultipartUpload
-    etags[i] = await putPartToPresignedUrl(urls[i], buffer);
+      // PUT directly to S3 — no rate-limit hit; capture ETag for CompleteMultipartUpload
+      etags[i] = await putPartToPresignedUrl(urls[i], buffer, signal);
 
-    completedChunks++;
-    onProgress?.({
-      phase: "uploading",
-      chunkIndex: completedChunks,
-      totalChunks,
-      percent: Math.round((completedChunks / totalChunks) * 98),
+      completedChunks++;
+      emit({
+        phase: "uploading",
+        chunkIndex: completedChunks,
+        totalChunks,
+        percent: Math.round((completedChunks / totalChunks) * 98),
+      });
     });
-  });
+  } catch (err) {
+    // Terminate worker and abort S3 multipart upload on any failure so S3 frees the parts.
+    encryptor?.terminate();
+    await abortMultipartUpload(roomId, fileId, uploadId);
+    // Re-wrap AbortError (from fetch signal) as CancelledError for consistent handling
+    if (err instanceof Error && err.name === "AbortError") throw new CancelledError();
+    throw err;
+  }
+  encryptor?.terminate();
 
   // 3. Complete multipart upload — assembles all parts into 1 S3 object
-  onProgress?.({ phase: "finalizing", chunkIndex: totalChunks, totalChunks, percent: 99 });
+  throwIfCancelled();
+  emit({ phase: "finalizing", chunkIndex: totalChunks, totalChunks, percent: 99 });
 
   const parts = etags.map((ETag, i) => ({ PartNumber: i + 1, ETag }));
   await completeMultipartUpload(
     roomId, fileId, file.name, file.size, totalChunks, CHUNK_SIZE, uploadId, parts
   );
 
-  onProgress?.({ phase: "uploading", chunkIndex: totalChunks, totalChunks, percent: 100 });
+  emit({ phase: "uploading", chunkIndex: totalChunks, totalChunks, percent: 100 });
 
   return { fileId, totalChunks };
 }
