@@ -34,7 +34,7 @@ const publicCompleteSchema = z.object({
 
 // Max chunks = ceil(2 GB / 5 MB) = 410. Cap at 500 to allow headroom.
 const MAX_ENCRYPTED_CHUNKS = 500;
-const CHUNK_SIZE_BYTES = 5 * 1024 * 1024; // must match frontend CHUNK_SIZE
+const CHUNK_SIZE_BYTES = 20 * 1024 * 1024; // must match frontend CHUNK_SIZE
 
 const encryptedPresignSchema = z.object({
   roomId: z.string().min(1),

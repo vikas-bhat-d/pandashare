@@ -3,7 +3,7 @@
 import { encryptChunk, deriveKey } from "./crypto";
 import { completeUpload, getPublicUploadPresignedUrl, completePublicUpload, getEncryptedUploadPresignedUrls } from "./api";
 
-const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB
+const CHUNK_SIZE = 20 * 1024 * 1024; // 5MB
 
 /**
  * Max number of chunks to encrypt+upload concurrently for password mode.
