@@ -419,6 +419,7 @@ export async function uploadFile(
   //    Parts are 1-indexed for S3; ETags indexed by part number (0-based array).
   const etags: string[] = new Array(totalChunks);
   let completedChunks = 0;
+  let encryptedChunks = 0;
 
   try {
     await runConcurrently(totalChunks, CHUNK_CONCURRENCY, async (i) => {
@@ -429,11 +430,30 @@ export async function uploadFile(
       let buffer = await file.slice(start, end).arrayBuffer();
       throwIfCancelled();
 
+      // Emit "encrypting chunk i" so the progress bar moves immediately — before the
+      // PBKDF2-derived key is used and before the S3 PUT. This prevents the bar from
+      // sitting at 0 % for the entire key-derivation + first-chunk duration.
+      emit({
+        phase: "encrypting",
+        chunkIndex: i,
+        totalChunks,
+        percent: Math.max(1, Math.round((i / totalChunks) * 49)),
+      });
+
       if (encryptor) {
         // Worker encrypts off the main thread; buffer is transferred (zero-copy)
         buffer = await encryptor.encrypt(i, buffer);
       }
       throwIfCancelled();
+
+      encryptedChunks++;
+      // Transition bar to the "uploading" phase (49–98 %) once encryption is done.
+      emit({
+        phase: "uploading",
+        chunkIndex: encryptedChunks,
+        totalChunks,
+        percent: Math.round(49 + (encryptedChunks / totalChunks) * 49),
+      });
 
       // PUT directly to S3 — no rate-limit hit; capture ETag for CompleteMultipartUpload
       // withRetry handles transient S3 / network errors (up to 4 attempts, exponential backoff)

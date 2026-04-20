@@ -153,6 +153,56 @@ export async function downloadFile(
       const reader = response.body!.getReader();
       let partBuffer = new Uint8Array(0);
       let partIndex = 0;
+      let receivedBytes = 0;
+      // Total expected bytes on the wire = plaintext size + 16-byte AES-GCM tag per chunk
+      const expectedEncryptedSize = (fileSize ?? 0) + parts * 16;
+
+      // Shared decrypt-and-write helper to avoid duplicating the logic below.
+      async function decryptAndWrite(encryptedBytes: Uint8Array): Promise<void> {
+        const chunkBase = (partIndex / parts) * 100;
+        const chunkSlot = 100 / parts;
+
+        onProgress?.({
+          phase: "decrypting",
+          chunkIndex: partIndex,
+          totalChunks: parts,
+          percent: Math.round(chunkBase + chunkSlot * 0.5),
+        });
+
+        const encryptedPart = encryptedBytes.buffer.slice(
+          encryptedBytes.byteOffset,
+          encryptedBytes.byteOffset + encryptedBytes.byteLength
+        ) as ArrayBuffer;
+
+        let decrypted: ArrayBuffer;
+        if (key && baseIVBytes) {
+          try {
+            decrypted = await decryptChunk(encryptedPart, key, partIndex, baseIVBytes!);
+          } catch {
+            await writer.abort("Decryption failed").catch(() => {});
+            throw new Error("Decryption failed — the password may be incorrect or the data is corrupted.");
+          }
+        } else {
+          decrypted = encryptedPart;
+        }
+
+        onProgress?.({
+          phase: "writing",
+          chunkIndex: partIndex,
+          totalChunks: parts,
+          percent: Math.round(chunkBase + chunkSlot * 0.9),
+        });
+
+        await writer.write(new Uint8Array(decrypted));
+        partIndex++;
+
+        onProgress?.({
+          phase: "writing",
+          chunkIndex: partIndex,
+          totalChunks: parts,
+          percent: Math.round((partIndex / parts) * 100),
+        });
+      }
 
       // Read the stream in arbitrary-sized network chunks.
       // Accumulate bytes until we have a full encrypted part, then decrypt + write.
@@ -161,59 +211,39 @@ export async function downloadFile(
         const { done, value } = await reader.read();
         if (done) break;
 
+        receivedBytes += value.byteLength;
+
+        // Emit byte-level download progress while chunks are still accumulating.
+        // Cap at 45 % so per-chunk decryption progress (starting at 50 %) never goes backwards.
+        if (partIndex === 0 && expectedEncryptedSize > 0) {
+          onProgress?.({
+            phase: "downloading",
+            chunkIndex: 0,
+            totalChunks: parts,
+            percent: Math.min(45, Math.round((receivedBytes / expectedEncryptedSize) * 45)),
+          });
+        }
+
         // Append incoming bytes to the accumulation buffer
         const combined = new Uint8Array(partBuffer.byteLength + value.byteLength);
         combined.set(partBuffer);
         combined.set(value, partBuffer.byteLength);
         partBuffer = combined;
 
-        // Drain as many complete encrypted chunks as possible
-        while (partIndex < parts && partBuffer.byteLength >= encryptedChunkSize) {
-          const isLastPart = partIndex === parts - 1;
-          // Last part may be smaller — consume all remaining bytes
-          const partLen = isLastPart ? partBuffer.byteLength : encryptedChunkSize;
-
-          const chunkBase = (partIndex / parts) * 100;
-          const chunkSlot = 100 / parts;
-
-          onProgress?.({
-            phase: "decrypting",
-            chunkIndex: partIndex,
-            totalChunks: parts,
-            percent: Math.round(chunkBase + chunkSlot * 0.5),
-          });
-
-          const encryptedPart = partBuffer.slice(0, partLen).buffer;
-          let decrypted: ArrayBuffer;
-          if (key && baseIVBytes) {
-            try {
-              decrypted = await decryptChunk(encryptedPart, key, partIndex, baseIVBytes);
-            } catch {
-              await writer.abort("Decryption failed").catch(() => {});
-              throw new Error("Decryption failed — the password may be incorrect or the data is corrupted.");
-            }
-          } else {
-            decrypted = encryptedPart;
-          }
-
-          onProgress?.({
-            phase: "writing",
-            chunkIndex: partIndex,
-            totalChunks: parts,
-            percent: Math.round(chunkBase + chunkSlot * 0.9),
-          });
-
-          await writer.write(new Uint8Array(decrypted));
-          partBuffer = partBuffer.slice(partLen);
-          partIndex++;
-
-          onProgress?.({
-            phase: "writing",
-            chunkIndex: partIndex,
-            totalChunks: parts,
-            percent: Math.round((partIndex / parts) * 100),
-          });
+        // Drain as many complete (full-size) encrypted chunks as possible.
+        // The last chunk is allowed to be smaller — it is handled after the loop.
+        while (partIndex < parts - 1 && partBuffer.byteLength >= encryptedChunkSize) {
+          await decryptAndWrite(partBuffer.slice(0, encryptedChunkSize));
+          partBuffer = partBuffer.slice(encryptedChunkSize);
         }
+      }
+
+      // Flush the final chunk. It is almost always smaller than encryptedChunkSize
+      // because the plaintext file size is rarely an exact multiple of chunkSize.
+      // Without this flush the last (or only) chunk is silently discarded, producing
+      // a 0-byte file for single-chunk files and truncated files otherwise.
+      if (partIndex < parts && partBuffer.byteLength > 0) {
+        await decryptAndWrite(partBuffer.slice(0));
       }
 
       await writer.close();
