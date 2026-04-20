@@ -3,6 +3,7 @@
 import React, { useEffect, useState, useCallback } from "react";
 import { getRoom, updateRoomExpiry, getRoomFiles, RoomMetadata, FileMetadata } from "@/utils/api";
 import { computeVerifier } from "@/utils/crypto";
+import { cleanupStaleUploads } from "@/utils/uploadPipeline";
 import { RoomFilesGrid } from "@/components/RoomFilesGrid";
 import { Shield, Clock, Copy, ArrowLeft, LockKeyhole, AlertCircle, Globe } from "lucide-react";
 import { toast } from "sonner";
@@ -98,6 +99,8 @@ export default function RoomPage() {
 
   useEffect(() => {
     loadRoom();
+    // Abort any multipart upload abandoned by a previous page load (refresh / tab close)
+    cleanupStaleUploads().catch(() => {});
     const handleHashChange = () => loadRoom();
     window.addEventListener("hashchange", handleHashChange);
     return () => window.removeEventListener("hashchange", handleHashChange);

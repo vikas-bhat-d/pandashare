@@ -2,7 +2,7 @@
 
 import { generateUUID } from "./utils";
 
-const BASE_URL = typeof window !== "undefined"
+export const BASE_URL = typeof window !== "undefined"
   ? (process.env.NEXT_PUBLIC_API_URL || "http://localhost:4000")
   : "http://localhost:4000";
 

@@ -7,6 +7,7 @@ import { apiLimiter } from "./middleware/rateLimit";
 import roomRoutes from "./routes/rooms";
 import uploadRoutes from "./routes/upload";
 import downloadRoutes from "./routes/download";
+import { ensureAbortIncompleteMultipartLifecycle } from "./services/storage.service";
 
 const app = express();
 
@@ -58,6 +59,12 @@ app.listen(config.PORT, () => {
   console.log(`\n  🐼 PandaShare API running on http://localhost:${config.PORT}`);
   console.log(`  📦 S3 endpoint: ${config.S3_ENDPOINT}`);
   console.log(`  🗄️  Database: ${config.DATABASE_URL ? "connected" : "not configured"}\n`);
+
+  // Set S3 lifecycle rule to auto-abort incomplete multipart uploads after 1 day.
+  // This is a best-effort safety net — errors are logged but never crash the server.
+  ensureAbortIncompleteMultipartLifecycle().catch((err) => {
+    console.warn("  ⚠️  Could not set S3 lifecycle rule for incomplete multipart uploads:", (err as Error).message);
+  });
 });
 
 export default app;

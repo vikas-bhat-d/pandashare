@@ -8,6 +8,7 @@ import {
   UploadPartCommand,
   CompleteMultipartUploadCommand,
   AbortMultipartUploadCommand,
+  PutBucketLifecycleConfigurationCommand,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { config } from "../config";
@@ -306,6 +307,40 @@ export async function deleteMultipartObject(
     new DeleteObjectCommand({
       Bucket: config.S3_BUCKET,
       Key: getMultipartKey(roomId, fileId),
+    })
+  );
+}
+
+// ──────────────────────────────────────
+// Bucket hygiene
+// ──────────────────────────────────────
+
+/**
+ * Ensures the S3 bucket has a lifecycle rule that automatically aborts any
+ * incomplete multipart upload after 1 day.
+ *
+ * This is the last-resort safety net for the browser-refresh / tab-close scenario
+ * where the beforeunload keepalive request did not reach the server in time.
+ *
+ * NOTE: PutBucketLifecycleConfiguration REPLACES all existing rules. For buckets
+ * that already have lifecycle rules managed externally (e.g., Terraform), set
+ * SKIP_LIFECYCLE_RULE=true in the environment to disable this call.
+ */
+export async function ensureAbortIncompleteMultipartLifecycle(): Promise<void> {
+  if (process.env.SKIP_LIFECYCLE_RULE === "true") return;
+  await s3.send(
+    new PutBucketLifecycleConfigurationCommand({
+      Bucket: config.S3_BUCKET,
+      LifecycleConfiguration: {
+        Rules: [
+          {
+            ID: "AbortIncompleteMultipartUploads",
+            Status: "Enabled",
+            Filter: { Prefix: "" }, // applies to all objects in the bucket
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 },
+          },
+        ],
+      },
     })
   );
 }

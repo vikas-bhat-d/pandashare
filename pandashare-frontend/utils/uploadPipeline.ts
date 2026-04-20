@@ -2,6 +2,7 @@
 
 import { encryptChunk, deriveKey } from "./crypto";
 import { generateUUID } from "./utils";
+import { BASE_URL } from "./apiClient";
 import {
   completeUpload,
   getPublicUploadPresignedUrl,
@@ -18,6 +19,111 @@ export class CancelledError extends Error {
   constructor() {
     super("Cancelled");
     this.name = "CancelledError";
+  }
+}
+
+// ── Retry helper ──────────────────────────────────────────────────────────────
+
+const RETRY_MAX_ATTEMPTS = 4;
+const RETRY_BASE_DELAY_MS = 1000;
+
+/**
+ * Run `fn` up to `maxAttempts` times with exponential backoff + ±25% jitter.
+ * Never retries CancelledError, AbortError, or non-retryable 4xx HTTP errors.
+ */
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  signal?: AbortSignal,
+  maxAttempts = RETRY_MAX_ATTEMPTS,
+): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (signal?.aborted) throw new CancelledError();
+    try {
+      return await fn();
+    } catch (err) {
+      if (err instanceof CancelledError) throw err;
+      if (err instanceof Error && err.name === "AbortError") throw new CancelledError();
+      lastErr = err;
+      // Don't retry 4xx client errors (except 408 Timeout and 429 Rate Limit)
+      if (err instanceof Error) {
+        const match = err.message.match(/:\s*(\d{3})\b/);
+        if (match) {
+          const status = parseInt(match[1]);
+          if (status >= 400 && status < 500 && status !== 408 && status !== 429) throw err;
+        }
+      }
+      if (attempt < maxAttempts - 1) {
+        const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt) * (0.75 + Math.random() * 0.5);
+        await new Promise<void>((resolve, reject) => {
+          const t = setTimeout(resolve, delay);
+          signal?.addEventListener("abort", () => { clearTimeout(t); reject(new CancelledError()); }, { once: true });
+        });
+      }
+    }
+  }
+  throw lastErr;
+}
+
+// ── Active upload tracking ────────────────────────────────────────────────────
+// Stores the in-progress multipart uploadId in localStorage so that:
+// a) a beforeunload handler can fire a keepalive abort request if the user
+//    refreshes or closes the tab mid-upload, and
+// b) cleanupStaleUploads() can abort any upload left behind by a previous session.
+
+const ACTIVE_UPLOAD_KEY = "ps_active_upload";
+
+interface ActiveUploadRecord {
+  roomId: string;
+  fileId: string;
+  uploadId: string;
+}
+
+/**
+ * Persists `record` to localStorage and registers a beforeunload handler that
+ * fires a keepalive fetch to abort the multipart upload if the page is unloaded.
+ * Returns an unregister function — call it on success, cancel, OR error so the
+ * entry is cleaned up and the handler is removed.
+ */
+function trackActiveUpload(record: ActiveUploadRecord): () => void {
+  if (typeof localStorage === "undefined") return () => {};
+  localStorage.setItem(ACTIVE_UPLOAD_KEY, JSON.stringify(record));
+
+  const abortOnUnload = () => {
+    const raw = localStorage.getItem(ACTIVE_UPLOAD_KEY);
+    if (!raw) return;
+    const { roomId, fileId, uploadId } = JSON.parse(raw) as ActiveUploadRecord;
+    fetch(`${BASE_URL}/api/upload/multipart/abort`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ roomId, fileId, uploadId }),
+      keepalive: true, // survives page unload
+    }).catch(() => {});
+  };
+
+  window.addEventListener("beforeunload", abortOnUnload);
+
+  return () => {
+    window.removeEventListener("beforeunload", abortOnUnload);
+    localStorage.removeItem(ACTIVE_UPLOAD_KEY);
+  };
+}
+
+/**
+ * Aborts any multipart upload that was left incomplete by a previous page
+ * load (e.g. the user refreshed mid-upload and beforeunload didn't fire).
+ * Safe to call on every room page mount — it no-ops when there is nothing to clean up.
+ */
+export async function cleanupStaleUploads(): Promise<void> {
+  if (typeof localStorage === "undefined") return;
+  const raw = localStorage.getItem(ACTIVE_UPLOAD_KEY);
+  if (!raw) return;
+  try {
+    const { roomId, fileId, uploadId } = JSON.parse(raw) as ActiveUploadRecord;
+    localStorage.removeItem(ACTIVE_UPLOAD_KEY);
+    await abortMultipartUpload(roomId, fileId, uploadId);
+  } catch {
+    // best-effort — S3 lifecycle rule is the final safety net
   }
 }
 
@@ -272,9 +378,9 @@ export async function uploadFile(
     emit({ phase: "uploading", chunkIndex: 0, totalChunks: 1, percent: 0 });
     const { url } = await getPublicUploadPresignedUrl(roomId, fileId, file.name, file.size);
 
-    // 2. PUT directly to S3 with real progress tracking
+    // 2. PUT directly to S3 with real progress tracking (retries up to 4 attempts)
     throwIfCancelled();
-    await putToPresignedUrl(url, file, emit, signal);
+    await withRetry(() => putToPresignedUrl(url, file, emit, signal), signal);
 
     // 3. Save metadata to DB
     throwIfCancelled();
@@ -306,6 +412,9 @@ export async function uploadFile(
      initiateMultipartUpload(roomId, fileId, file.name, file.size, totalChunks, CHUNK_SIZE)),
   ]);
 
+  // Register beforeunload abort + stale-upload cleanup for this multipart session
+  const untrackUpload = trackActiveUpload({ roomId, fileId, uploadId });
+
   // 2. Encrypt + PUT each part directly to S3 (up to CHUNK_CONCURRENCY at once)
   //    Parts are 1-indexed for S3; ETags indexed by part number (0-based array).
   const etags: string[] = new Array(totalChunks);
@@ -327,7 +436,8 @@ export async function uploadFile(
       throwIfCancelled();
 
       // PUT directly to S3 — no rate-limit hit; capture ETag for CompleteMultipartUpload
-      etags[i] = await putPartToPresignedUrl(urls[i], buffer, signal);
+      // withRetry handles transient S3 / network errors (up to 4 attempts, exponential backoff)
+      etags[i] = await withRetry(() => putPartToPresignedUrl(urls[i], buffer, signal), signal);
 
       completedChunks++;
       emit({
@@ -340,6 +450,7 @@ export async function uploadFile(
   } catch (err) {
     // Terminate worker and abort S3 multipart upload on any failure so S3 frees the parts.
     encryptor?.terminate();
+    untrackUpload();
     await abortMultipartUpload(roomId, fileId, uploadId);
     // Re-wrap AbortError (from fetch signal) as CancelledError for consistent handling
     if (err instanceof Error && err.name === "AbortError") throw new CancelledError();
@@ -355,6 +466,9 @@ export async function uploadFile(
   await completeMultipartUpload(
     roomId, fileId, file.name, file.size, totalChunks, CHUNK_SIZE, uploadId, parts
   );
+
+  // Upload fully committed — remove tracking entry and beforeunload handler
+  untrackUpload();
 
   emit({ phase: "uploading", chunkIndex: totalChunks, totalChunks, percent: 100 });
 
