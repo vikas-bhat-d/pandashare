@@ -389,3 +389,66 @@ export async function deletePublicFile(
     })
   );
 }
+
+/**
+ * Delete all S3 objects belonging to a room's files.
+ *
+ * Handles all three storage layouts:
+ *  - Multipart files  → single object at multipart/{roomId}/{fileId}
+ *  - Chunked files    → objects at encrypted/{roomId}/{fileId}.{0..n-1}
+ *  - Public files     → single object at public/{roomId}/{fileId}
+ *
+ * Uses batched DeleteObjects (max 1 000 keys per request) to stay within S3 limits.
+ * Errors from individual batch deletes are collected and rethrown after all batches
+ * so a single bad key never prevents the rest from being cleaned up.
+ *
+ * @param roomId  The room whose objects should be removed.
+ * @param files   The file records (from Prisma) associated with the room.
+ */
+export async function deleteRoomS3Files(
+  roomId: string,
+  files: Array<{ id: string; totalChunks: number; isMultipart: boolean }>
+): Promise<void> {
+  const keys: string[] = [];
+
+  for (const file of files) {
+    if (file.isMultipart) {
+      // Single object per multipart-uploaded file
+      keys.push(getMultipartKey(roomId, file.id));
+    } else if (file.totalChunks > 0) {
+      // One object per encrypted chunk
+      for (let i = 0; i < file.totalChunks; i++) {
+        keys.push(getChunkKey(roomId, file.id, i));
+      }
+    } else {
+      // Public (unencrypted) file stored as a single object
+      keys.push(getPublicKey(roomId, file.id));
+    }
+  }
+
+  if (keys.length === 0) return;
+
+  const batchSize = 1000;
+  const errors: Error[] = [];
+
+  for (let i = 0; i < keys.length; i += batchSize) {
+    const batch = keys.slice(i, i + batchSize).map((Key) => ({ Key }));
+    try {
+      await s3.send(
+        new DeleteObjectsCommand({
+          Bucket: config.S3_BUCKET,
+          Delete: { Objects: batch, Quiet: true },
+        })
+      );
+    } catch (err) {
+      errors.push(err as Error);
+    }
+  }
+
+  if (errors.length > 0) {
+    throw new AggregateError(
+      errors,
+      `S3 batch delete failed for room ${roomId}: ${errors.map((e) => e.message).join("; ")}`
+    );
+  }
+}

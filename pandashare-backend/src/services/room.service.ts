@@ -1,5 +1,6 @@
 import { PrismaClient, RoomMode } from "@prisma/client";
 import crypto from "crypto";
+import { deleteRoomS3Files } from "./storage.service";
 
 const prisma = new PrismaClient();
 
@@ -135,4 +136,42 @@ export async function getExpiredRooms() {
  */
 export async function deleteRoom(id: string) {
   return prisma.room.delete({ where: { id } });
+}
+
+/**
+ * Delete all expired rooms and their S3 objects.
+ *
+ * For each expired room:
+ *  1. Delete S3 objects for every file (chunked, multipart, or public).
+ *  2. Delete the room row from the DB (Prisma cascades to File rows via onDelete: Cascade).
+ *
+ * Rooms whose S3 cleanup fails are skipped so a single bad room doesn't block the rest.
+ * All errors are returned to the caller for logging.
+ *
+ * @returns counts of successfully deleted rooms and any errors encountered.
+ */
+export async function cleanupExpiredRooms(): Promise<{
+  deleted: number;
+  errors: Array<{ roomId: string; error: Error }>;
+}> {
+  const expiredRooms = await getExpiredRooms();
+
+  let deleted = 0;
+  const errors: Array<{ roomId: string; error: Error }> = [];
+
+  for (const room of expiredRooms) {
+    try {
+      // 1. Remove all S3 objects for this room's files
+      await deleteRoomS3Files(room.id, room.files);
+
+      // 2. Remove the room (and cascade-delete File rows) from the DB
+      await deleteRoom(room.id);
+
+      deleted++;
+    } catch (err) {
+      errors.push({ roomId: room.id, error: err as Error });
+    }
+  }
+
+  return { deleted, errors };
 }

@@ -1,5 +1,5 @@
-import dotenv from "dotenv";
-dotenv.config();
+// dotenv/config is the side-effect import — works across all dotenv versions (v6–v17+)
+import "dotenv/config";
 
 export const config = {
   PORT: parseInt(process.env.PORT || "4000"),
