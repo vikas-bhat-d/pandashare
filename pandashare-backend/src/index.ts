@@ -17,7 +17,7 @@ app.listen(config.PORT, () => {
     console.warn("  ??  Could not set S3 lifecycle rule:", (err as Error).message);
   });
 
-  // Periodic expired-room cleanup — runs immediately then every 15 minutes.
+  // Periodic expired-room cleanup runs immediately then every 15 minutes.
   const CLEANUP_INTERVAL_MS = 15 * 60 * 1000;
 
   async function runCleanup() {
