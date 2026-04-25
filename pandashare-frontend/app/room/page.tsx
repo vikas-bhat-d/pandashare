@@ -72,10 +72,16 @@ export default function RoomPage() {
 
     setRoom(data);
 
-    // Calculate remaining hours
-    const remainingMs = new Date(data.expiresAt).getTime() - Date.now();
-    const hours = Math.round(remainingMs / (1000 * 60 * 60));
-    setExpiryHours(hours > 0 ? hours : 24);
+    // Calculate hours elapsed from creation → expiry (so dropdown shows hours-from-creation)
+    const createdMs = new Date(data.createdAt).getTime();
+    const expiresMs = new Date(data.expiresAt).getTime();
+    const hoursFromCreation = Math.round((expiresMs - createdMs) / (1000 * 60 * 60));
+    // Clamp to valid options: 1,4,12,24,48
+    const validOptions = [1, 4, 12, 24, 48];
+    const nearest = validOptions.reduce((prev, cur) =>
+      Math.abs(cur - hoursFromCreation) < Math.abs(prev - hoursFromCreation) ? cur : prev
+    );
+    setExpiryHours(nearest);
 
     // Public room — files already in response
     if (data.mode === "public") {
@@ -131,11 +137,11 @@ export default function RoomPage() {
     if (!room) return;
     setExpiryHours(newHours);
     setIsUpdatingExpiry(true);
-    await updateRoomExpiry(room.id, newHours);
+    const result = await updateRoomExpiry(room.id, newHours);
     setIsUpdatingExpiry(false);
     setRoom({
       ...room,
-      expiresAt: new Date(Date.now() + newHours * 60 * 60 * 1000).toISOString(),
+      expiresAt: result.expiresAt,
     });
   };
 
@@ -292,21 +298,33 @@ export default function RoomPage() {
             </span>
 
             {/* Expiry Settings */}
-            <div className="flex items-center space-x-2 bg-[#121212] border border-white/10 text-[#a1a1aa] px-3 py-1.5 rounded-sm shadow-sm">
-              <Clock size={14} className={isUpdatingExpiry ? "animate-spin text-white" : ""} />
-              <span className="font-medium text-xs">Expires in:</span>
-              <select
-                className="bg-transparent font-semibold outline-none cursor-pointer text-xs focus:ring-0 text-white"
-                value={expiryHours}
-                onChange={handleExpiryChange}
-                disabled={isUpdatingExpiry}
-              >
-                <option value={1} className="text-[#f4f4f5] bg-[#121212]">1 hour</option>
-                <option value={4} className="text-[#f4f4f5] bg-[#121212]">4 hours</option>
-                <option value={12} className="text-[#f4f4f5] bg-[#121212]">12 hours</option>
-                <option value={24} className="text-[#f4f4f5] bg-[#121212]">24 hours</option>
-                <option value={48} className="text-[#f4f4f5] bg-[#121212]">48 hours (Max)</option>
-              </select>
+            <div className="flex flex-col items-center gap-1">
+              <div className="flex items-center space-x-2 bg-[#121212] border border-white/10 text-[#a1a1aa] px-3 py-1.5 rounded-sm shadow-sm">
+                <Clock size={14} className={isUpdatingExpiry ? "animate-spin text-white" : ""} />
+                <span className="font-medium text-xs">Expires in:</span>
+                <select
+                  className="bg-transparent font-semibold outline-none cursor-pointer text-xs focus:ring-0 text-white"
+                  value={expiryHours}
+                  onChange={handleExpiryChange}
+                  disabled={isUpdatingExpiry}
+                >
+                  <option value={1} className="text-[#f4f4f5] bg-[#121212]">1 hour</option>
+                  <option value={4} className="text-[#f4f4f5] bg-[#121212]">4 hours</option>
+                  <option value={12} className="text-[#f4f4f5] bg-[#121212]">12 hours</option>
+                  <option value={24} className="text-[#f4f4f5] bg-[#121212]">24 hours</option>
+                  <option value={48} className="text-[#f4f4f5] bg-[#121212]">48 hours (Max)</option>
+                </select>
+              </div>
+              <span className="text-[10px] text-[#52525b]">
+                {new Date(room.expiresAt).toLocaleString("en-IN", {
+                  timeZone: "Asia/Kolkata",
+                  day: "2-digit",
+                  month: "short",
+                  hour: "2-digit",
+                  minute: "2-digit",
+                  hour12: true,
+                })}{" "}IST
+              </span>
             </div>
           </div>
         </div>

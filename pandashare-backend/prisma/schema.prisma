@@ -42,3 +42,18 @@ enum RoomMode {
   password
   public
 }
+
+model TextSnippet {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  mode      RoomMode
+  content   String   // plaintext (public) or base64 AES-GCM ciphertext (password)
+  salt      String?  // base64-encoded, null for public snippets
+  baseIV    String?  // base64-encoded, null for public snippets
+  verifier  String?  // HMAC-SHA256(name|password) hex, null for public snippets
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+
+  @@index([name])
+  @@index([expiresAt])
+}

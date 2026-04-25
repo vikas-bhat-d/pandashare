@@ -93,6 +93,81 @@ export async function updateRoomExpiry(id: string, hours: number): Promise<{ exp
 }
 
 // ──────────────────────────────────────
+// Text Snippet API
+// ──────────────────────────────────────
+
+export interface SnippetMetadata {
+  id: string;
+  name: string;
+  mode: "password" | "public";
+  salt?: string | null;
+  baseIV?: string | null;
+  createdAt: string;
+  expiresAt: string;
+}
+
+export async function createSnippet(data: {
+  name: string;
+  mode: "password" | "public";
+  content: string; // plaintext for public; base64 ciphertext for password
+  salt?: string;
+  baseIV?: string;
+  verifier?: string;
+  expiresInDays?: number;
+}): Promise<SnippetMetadata> {
+  return apiJson<SnippetMetadata>("/api/snippets", {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+}
+
+export async function getSnippet(nameOrId: string): Promise<SnippetMetadata | null> {
+  try {
+    return await apiJson<SnippetMetadata>(`/api/snippets/${encodeURIComponent(nameOrId)}`);
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 404) return null;
+    throw err;
+  }
+}
+
+export async function getSnippetContent(
+  nameOrId: string,
+  verifier?: string
+): Promise<string | null> {
+  try {
+    const result = await apiJson<{ content: string }>(
+      `/api/snippets/${encodeURIComponent(nameOrId)}/content`,
+      verifier ? { headers: { "x-snippet-verifier": verifier } } : undefined
+    );
+    return result.content;
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 401) return null;
+    throw err;
+  }
+}
+
+export async function updateSnippetExpiry(id: string, days: number): Promise<{ expiresAt: string }> {
+  return apiJson<{ expiresAt: string }>(`/api/snippets/${encodeURIComponent(id)}/expiry`, {
+    method: "PATCH",
+    body: JSON.stringify({ days }),
+  });
+}
+
+export async function updateSnippetContent(
+  id: string,
+  content: string,
+  verifier?: string,
+  salt?: string,
+  baseIV?: string
+): Promise<SnippetMetadata> {
+  return apiJson<SnippetMetadata>(`/api/snippets/${encodeURIComponent(id)}/content`, {
+    method: "PATCH",
+    body: JSON.stringify({ content, salt, baseIV }),
+    ...(verifier ? { headers: { "x-snippet-verifier": verifier } } : {}),
+  });
+}
+
+// ──────────────────────────────────────
 // Upload API
 // ──────────────────────────────────────
 

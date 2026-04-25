@@ -191,11 +191,25 @@ export function RoomFilesGrid({
 
   // ── Upload Logic ────────────────────────────
 
+  const FILE_SIZE_LIMIT = 2 * 1024 * 1024 * 1024; // 2 GB for private/password rooms
+
   const processFiles = (rawFiles: File[]) => {
-    if (mode === "password" && !password) {
-      setPendingUploads(rawFiles);
-      setUploadPasswordPrompt(true);
-      return;
+    if (mode === "password") {
+      // Enforce 2 GB per-file limit for private (encrypted) rooms
+      const oversized = rawFiles.filter((f) => f.size > FILE_SIZE_LIMIT);
+      if (oversized.length > 0) {
+        oversized.forEach((f) =>
+          toast.error(`"${f.name}" exceeds the 2 GB limit for private rooms.`)
+        );
+        const allowed = rawFiles.filter((f) => f.size <= FILE_SIZE_LIMIT);
+        if (allowed.length === 0) return;
+        rawFiles = allowed;
+      }
+      if (!password) {
+        setPendingUploads(rawFiles);
+        setUploadPasswordPrompt(true);
+        return;
+      }
     }
     actualProcessFiles(rawFiles, password);
   };

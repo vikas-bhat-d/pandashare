@@ -52,13 +52,14 @@ export async function apiJson<T>(
   options?: RequestInit
 ): Promise<T> {
   const deviceId = getDeviceId();
+  const { headers: optHeaders, ...restOptions } = options ?? {};
   const res = await fetch(`${BASE_URL}${path}`, {
     headers: {
       "Content-Type": "application/json",
       ...(deviceId ? { "x-device-id": deviceId } : {}),
-      ...options?.headers,
+      ...(optHeaders as Record<string, string> | undefined),
     },
-    ...options,
+    ...restOptions,
   });
 
   if (!res.ok) {

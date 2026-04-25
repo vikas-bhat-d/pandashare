@@ -1,23 +1,152 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { generateRoomName, generateSalt, generateBaseIV, computeVerifier } from "@/utils/crypto";
 import { createRoom, getRoom, toBase64 } from "@/utils/api";
-import { Terminal, ShieldCheck, ShieldOff, ExternalLink, AlertCircle } from "lucide-react";
+import { Terminal, ShieldCheck, ShieldOff, AlertCircle, FileText } from "lucide-react";
 import { toast } from "sonner";
+
+// ── Text Snippet Entry Component ──────────────────────────────────────────────
+function TextSnippetEntry() {
+  const router = useRouter();
+  const [snippetName, setSnippetName] = useState("");
+  const [snippetPassword, setSnippetPassword] = useState("");
+  const [isEncrypted, setIsEncrypted] = useState(true);
+  const isDefaultName = useRef(true);
+
+  useEffect(() => {
+    setSnippetName(generateRoomName());
+    isDefaultName.current = true;
+  }, []);
+
+  const handleFocus = () => {
+    if (isDefaultName.current) {
+      setSnippetName("");
+      isDefaultName.current = false;
+    }
+  };
+
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    isDefaultName.current = false;
+    setSnippetName(e.target.value);
+  };
+
+  const handleGo = () => {
+    if (!snippetName.trim()) return;
+    // Navigate directly — text page handles both new and existing snippets.
+    // Password stays in the fragment, never reaches the server.
+    const name = encodeURIComponent(snippetName.trim());
+    const pwd = isEncrypted && snippetPassword.trim()
+      ? `|${encodeURIComponent(snippetPassword.trim())}`
+      : "";
+    router.push(`/text/#${name}${pwd}`);
+  };
+
+  return (
+    <div className="flex flex-col gap-4 w-full">
+      <div className="flex flex-col sm:flex-row gap-4 w-full items-center justify-between">
+        <div className="flex-1 flex flex-col sm:flex-row gap-4 w-full text-sm">
+          <div className="relative flex-1">
+            <div className="absolute inset-y-0 left-0 flex items-center pl-3 text-[#52525b] pointer-events-none">
+              <FileText size={16} />
+            </div>
+            <input
+              type="text"
+              value={snippetName}
+              onChange={handleChange}
+              onFocus={handleFocus}
+              className="w-full bg-[#1a1a1a] border border-white/5 rounded-md py-3 pl-10 pr-4 text-white focus:outline-none focus:border-white/20 focus:ring-1 focus:ring-white/20 transition-all placeholder:text-[#52525b]"
+              placeholder="Snippet name"
+              onKeyDown={(e) => e.key === "Enter" && handleGo()}
+            />
+          </div>
+          {isEncrypted && (
+            <div className="relative flex-1 animate-in fade-in slide-in-from-top-2 duration-200">
+              <input
+                type="password"
+                value={snippetPassword}
+                onChange={(e) => setSnippetPassword(e.target.value)}
+                className="w-full bg-[#1a1a1a] border border-white/5 rounded-md py-3 px-4 text-white focus:outline-none focus:border-white/20 focus:ring-1 focus:ring-white/20 transition-all placeholder:text-[#52525b]"
+                placeholder="Password (optional)"
+                onKeyDown={(e) => e.key === "Enter" && handleGo()}
+              />
+            </div>
+          )}
+        </div>
+        <button
+          onClick={handleGo}
+          disabled={!snippetName}
+          className="w-full sm:w-auto self-stretch flex items-center justify-center bg-transparent border border-[#52525b] text-[#a1a1aa] px-6 py-3 rounded-md font-medium hover:text-white hover:border-white transition-colors disabled:opacity-50"
+        >
+          Go
+        </button>
+      </div>
+
+      <div className="flex items-center justify-between pt-2 border-t border-white/5">
+        <button
+          onClick={() => setIsEncrypted(!isEncrypted)}
+          className="flex items-center gap-2 text-xs text-[#a1a1aa] hover:text-white transition-colors"
+        >
+          {isEncrypted ? (
+            <ShieldCheck size={14} className="text-emerald-500" />
+          ) : (
+            <ShieldOff size={14} className="text-amber-500" />
+          )}
+          <span>
+            {isEncrypted ? "End-to-end encryption enabled" : "Encryption disabled — text is public"}
+          </span>
+        </button>
+        <button
+          onClick={() => setIsEncrypted(!isEncrypted)}
+          className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+            isEncrypted ? "bg-emerald-600" : "bg-[#52525b]"
+          }`}
+        >
+          <span
+            className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${
+              isEncrypted ? "translate-x-4" : "translate-x-0.5"
+            }`}
+          />
+        </button>
+      </div>
+
+      {!isEncrypted && (
+        <div className="flex items-center gap-2 text-xs text-amber-400/80 bg-amber-500/5 border border-amber-500/10 rounded px-3 py-2 animate-in fade-in slide-in-from-top-2 duration-200">
+          <AlertCircle size={14} className="shrink-0" />
+          Text will not be encrypted. Anyone with the snippet link can read it.
+        </div>
+      )}
+    </div>
+  );
+}
 
 export default function Home() {
   const router = useRouter();
   const [roomName, setRoomName] = useState("");
   const [password, setPassword] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const [activeTab, setActiveTab] = useState<"server" | "webrtc">("server");
+  const [activeTab, setActiveTab] = useState<"server" | "text" | "webrtc">("server");
   const [isEncrypted, setIsEncrypted] = useState(true);
+  // Track whether the room name is still the auto-generated default
+  const isDefaultName = useRef(true);
 
   useEffect(() => {
     setRoomName(generateRoomName());
+    isDefaultName.current = true;
   }, []);
+
+  const handleRoomNameFocus = () => {
+    if (isDefaultName.current) {
+      setRoomName("");
+      isDefaultName.current = false;
+    }
+  };
+
+  const handleRoomNameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    isDefaultName.current = false;
+    setRoomName(e.target.value);
+  };
 
   const handleGo = async () => {
     if (!roomName.trim()) return;
@@ -71,10 +200,10 @@ export default function Home() {
         <div className="text-2xl font-bold tracking-tight flex items-center">
           <span className="text-white">pandashare</span>
         </div>
-        <div className="hidden md:flex items-center gap-6 text-sm text-[#a1a1aa]">
+        <div className="flex items-center gap-6 text-sm text-[#a1a1aa]">
           <a href="https://github.com/vikas-bhat-d/pandashare" target="_blank" rel="noopener noreferrer" className="hover:text-white transition-colors flex items-center gap-1.5">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
-            <span>GitHub</span>
+            <span className="inline">GitHub</span>
           </a>
         </div>
       </nav>
@@ -100,14 +229,21 @@ export default function Home() {
                   onClick={() => setActiveTab("server")}
                   className={`relative pb-3 transition-colors ${activeTab === "server" ? "text-white" : "hover:text-white"}`}
                 >
-                   <span className="relative z-10">Client-Server</span>
+                   <span className="relative z-10">Files</span>
                    {activeTab === "server" && <span className="absolute bottom-0 left-0 right-0 h-[1px] bg-white"></span>}
+                </button>
+                <button 
+                  onClick={() => setActiveTab("text")}
+                  className={`relative pb-3 transition-colors ${activeTab === "text" ? "text-white" : "hover:text-white"}`}
+                >
+                   <span className="relative z-10">Text</span>
+                   {activeTab === "text" && <span className="absolute bottom-0 left-0 right-0 h-[1px] bg-white"></span>}
                 </button>
                 <button 
                   onClick={() => setActiveTab("webrtc")}
                   className={`relative pb-3 transition-colors ${activeTab === "webrtc" ? "text-white" : "hover:text-white"}`}
                 >
-                   <span className="relative z-10">Peer-to-Peer</span>
+                   <span className="relative z-10">P2P</span>
                    {activeTab === "webrtc" && <span className="absolute bottom-0 left-0 right-0 h-[1px] bg-white"></span>}
                 </button>
              </div>
@@ -127,9 +263,10 @@ export default function Home() {
                          <input 
                            type="text" 
                            value={roomName}
-                           onChange={(e) => setRoomName(e.target.value)}
+                           onChange={handleRoomNameChange}
+                           onFocus={handleRoomNameFocus}
                            className="w-full bg-[#1a1a1a] border border-white/5 rounded-md py-3 pl-10 pr-4 text-white focus:outline-none focus:border-white/20 focus:ring-1 focus:ring-white/20 transition-all placeholder:text-[#52525b]"
-                           placeholder="Room code"
+                           placeholder="Room name"
                          />
                       </div>
                       {/* Password input — only when encryption is ON */}
@@ -194,6 +331,8 @@ export default function Home() {
                    </div>
                  )}
                </div>
+             ) : activeTab === "text" ? (
+               <TextSnippetEntry />
              ) : (
                <div className="w-full flex items-center justify-center py-2 text-[#a1a1aa] text-sm">
                  <span className="flex items-center gap-2">

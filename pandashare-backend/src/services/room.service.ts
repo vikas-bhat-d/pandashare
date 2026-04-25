@@ -109,11 +109,14 @@ export async function getFilesIfAuthorized(
 }
 
 /**
- * Update a room's expiry time. Capped at 48 hours from now.
+ * Update a room's expiry time, computed from its original creation time.
+ * Capped at 48 hours from creation.
  */
 export async function updateExpiry(id: string, hours: number) {
+  const room = await prisma.room.findUnique({ where: { id }, select: { createdAt: true } });
+  if (!room) throw new Error("Room not found");
   const maxHours = Math.min(hours, 48);
-  const expiresAt = new Date(Date.now() + maxHours * 60 * 60 * 1000);
+  const expiresAt = new Date(room.createdAt.getTime() + maxHours * 60 * 60 * 1000);
   return prisma.room.update({
     where: { id },
     data: { expiresAt },
