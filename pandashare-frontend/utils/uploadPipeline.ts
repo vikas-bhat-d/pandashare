@@ -434,6 +434,28 @@ export async function uploadFile(
   const etags: string[] = new Array(totalChunks);
   let completedChunks = 0;
 
+  // Track byte progress for each chunk independently, then aggregate to show
+  // smooth progress during parallel uploads (not just when chunks complete)
+  const chunkBytesUploaded = new Map<number, number>();
+  for (let i = 0; i < totalChunks; i++) {
+    chunkBytesUploaded.set(i, 0);
+  }
+
+  // Emit aggregated progress whenever any chunk makes progress
+  const emitAggregatedProgress = () => {
+    let totalBytesUploaded = 0;
+    chunkBytesUploaded.forEach((bytes) => {
+      totalBytesUploaded += bytes;
+    });
+    const percent = Math.min(98, Math.round((totalBytesUploaded / file.size) * 98));
+    emit({
+      phase: "uploading",
+      chunkIndex: completedChunks,
+      totalChunks,
+      percent,
+    });
+  };
+
   try {
     await runConcurrently(totalChunks, CHUNK_CONCURRENCY, async (i) => {
       throwIfCancelled();
@@ -460,19 +482,19 @@ export async function uploadFile(
       }
       throwIfCancelled();
 
-      // PUT directly to S3 — no rate-limit hit; capture ETag for CompleteMultipartUpload
+      // PUT directly to S3 with granular progress tracking per chunk
       // withRetry handles transient S3 / network errors (up to 4 attempts, exponential backoff)
-      etags[i] = await withRetry(() => putPartToPresignedUrl(urls[i], buffer, signal), signal);
+      etags[i] = await withRetry(
+        () => putPartToPresignedUrl(urls[i], buffer, signal, (loaded, total) => {
+          chunkBytesUploaded.set(i, loaded);
+          emitAggregatedProgress();
+        }),
+        signal
+      );
 
-      // Only emit progress AFTER upload completes (not after encryption)
-      // This prevents the bar from jumping ahead when chunks are still uploading
+      // Mark chunk as complete
       completedChunks++;
-      emit({
-        phase: "uploading",
-        chunkIndex: completedChunks,
-        totalChunks,
-        percent: Math.min(98, Math.round((completedChunks / totalChunks) * 98)),
-      });
+      emitAggregatedProgress();
     });
   } catch (err) {
     // Terminate worker and abort S3 multipart upload on any failure so S3 frees the parts.
