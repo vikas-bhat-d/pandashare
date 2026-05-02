@@ -5,20 +5,135 @@
 //   - No bytes accumulate in JS heap — safe for 2 GB+ files
 //   - Supported: Chrome, Edge, Firefox, Samsung Internet, Safari 11.1+
 //
-// TODO: Add per-chunk retry with exponential back-off.
+// Optimizations:
+//   - Web Worker decryption (off main thread)
+//   - Concurrent chunk download + decryption
+//   - Aggressive progress throttling
+//   - Axios for cleaner API
 
+import axios from "axios";
 import { decryptChunk, deriveKey } from "./crypto";
 import { getEncryptedDownloadPresignedUrls, fromBase64, getPresignedUrl, getMultipartDownloadPresignedUrl } from "./api";
 import { CancelledError } from "./uploadPipeline";
+
+/**
+ * Max number of chunks to download+decrypt concurrently.
+ * Higher = better throughput, but more memory & CPU usage.
+ */
+const DOWNLOAD_CONCURRENCY = 4;
+
+// ── Crypto Worker (Decryption) ───────────────────────────────────────────────
+// Decryption is CPU-intensive. Running it on the main thread blocks React
+// renders and causes UI jank. A Web Worker runs on a separate OS thread.
+
+interface CryptoDecryptor {
+  /** Decrypt one chunk. `buffer` is TRANSFERRED — caller must not use it after this call. */
+  decrypt(chunkIndex: number, buffer: ArrayBuffer): Promise<ArrayBuffer>;
+  /** Terminate the worker immediately (call on success AND failure). */
+  terminate(): void;
+}
+
+function createWorkerDecryptor(
+  password: string,
+  salt: Uint8Array,
+  baseIV: Uint8Array
+): Promise<CryptoDecryptor> {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL("./decrypt.worker.ts", import.meta.url));
+    const pending = new Map<number, { res: (b: ArrayBuffer) => void; rej: (e: Error) => void }>();
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    worker.onmessage = ({ data }: MessageEvent<any>) => {
+      if (data.type === "ready") {
+        resolve({
+          decrypt(idx, buf) {
+            return new Promise((res, rej) => {
+              pending.set(idx, { res, rej });
+              // Transfer buf to the worker — zero-copy, main thread loses the reference
+              worker.postMessage({ type: "decrypt", id: idx, buffer: buf, chunkIndex: idx }, [buf]);
+            });
+          },
+          terminate() { worker.terminate(); },
+        });
+      } else if (data.type === "done") {
+        pending.get(data.id)?.res(data.buffer as ArrayBuffer);
+        pending.delete(data.id);
+      } else if (data.type === "error") {
+        const err = new Error((data.message as string) ?? "Crypto worker error");
+        if (data.id !== undefined) {
+          pending.get(data.id)?.rej(err);
+          pending.delete(data.id);
+        } else {
+          reject(err);
+        }
+      }
+    };
+
+    worker.onerror = (e) => reject(new Error(`Crypto worker failed: ${e.message}`));
+
+    // Copy the typed array data into plain ArrayBuffers before sending
+    const saltBuf = salt.buffer.slice(salt.byteOffset, salt.byteOffset + salt.byteLength);
+    const ivBuf   = baseIV.buffer.slice(baseIV.byteOffset, baseIV.byteOffset + baseIV.byteLength);
+    worker.postMessage({ type: "init", password, salt: saltBuf, baseIV: ivBuf });
+  });
+}
+
+async function makeCryptoDecryptor(
+  password: string,
+  salt: Uint8Array,
+  baseIV: Uint8Array
+): Promise<CryptoDecryptor> {
+  if (typeof Worker !== "undefined") {
+    try {
+      return await createWorkerDecryptor(password, salt, baseIV);
+    } catch {
+      // Worker unavailable — fall through to main-thread fallback
+    }
+  }
+  // Fallback: derive key on main thread
+  const key = await deriveKey(password, salt);
+  return {
+    decrypt: (idx, buf) => decryptChunk(buf, key, idx, baseIV),
+    terminate: () => {},
+  };
+}
 
 /**
  * Fetch one encrypted chunk directly from S3 via a presigned GET URL.
  * Bypasses the Node server — no rate-limit hits per chunk.
  */
 async function fetchChunkFromUrl(url: string, signal?: AbortSignal): Promise<ArrayBuffer> {
-  const res = await fetch(url, { signal });
-  if (!res.ok) throw new Error(`S3 chunk fetch failed: ${res.status} ${res.statusText}`);
-  return res.arrayBuffer();
+  try {
+    const response = await axios.get<ArrayBuffer>(url, {
+      responseType: "arraybuffer",
+      signal,
+    });
+    return response.data;
+  } catch (err) {
+    if (axios.isCancel(err) || (err instanceof Error && err.name === "AbortError")) {
+      throw new CancelledError();
+    }
+    if (axios.isAxiosError(err)) {
+      throw new Error(`S3 chunk fetch failed: ${err.response?.status || err.message}`);
+    }
+    throw err;
+  }
+}
+
+// ── Progress Throttle ─────────────────────────────────────────────────────────
+// Drastically reduce React setState calls. Emit at most ~8 updates/sec.
+function makeProgressEmitter(
+  cb?: (p: DownloadProgress) => void
+): (p: DownloadProgress) => void {
+  if (!cb) return () => {};
+  let lastMs = 0;
+  return (p: DownloadProgress) => {
+    const now = Date.now();
+    if (p.percent === 0 || p.percent >= 99 || now - lastMs >= 120) {
+      lastMs = now;
+      cb(p);
+    }
+  };
 }
 
 /**
@@ -83,6 +198,7 @@ export async function downloadFile(
   } = {}
 ): Promise<void> {
   const { password, salt, baseIV, fileSize, isMultipart, chunkSize, signal, onProgress } = options;
+  const emitProgress = makeProgressEmitter(onProgress);
 
   function throwIfCancelled() {
     if (signal?.aborted) throw new CancelledError();
@@ -91,7 +207,7 @@ export async function downloadFile(
   // ── Public mode: single presigned URL → StreamSaver ──────────────────────────
   if (mode === "public") {
     const url = await getPresignedUrl(roomId, fileId);
-    onProgress?.({ phase: "downloading", chunkIndex: 0, totalChunks: 1, percent: 0 });
+    emitProgress({ phase: "downloading", chunkIndex: 0, totalChunks: 1, percent: 0 });
     const writable = await createStreamSaverWritable(fileName, fileSize);
     const response = await fetch(url);
     if (!response.ok) throw new Error(`Download failed: ${response.status}`);
@@ -105,7 +221,7 @@ export async function downloadFile(
         if (done) break;
         await writer.write(value);
         received += value.byteLength;
-        onProgress?.({
+        emitProgress({
           phase: "downloading",
           chunkIndex: 0,
           totalChunks: 1,
@@ -119,24 +235,23 @@ export async function downloadFile(
       await writer.abort(err).catch(() => {});
       throw err;
     }
-    onProgress?.({ phase: "writing", chunkIndex: 1, totalChunks: 1, percent: 100 });
+    emitProgress({ phase: "writing", chunkIndex: 1, totalChunks: 1, percent: 100 });
     return;
   }
 
   // ── Password mode: chunked encrypted download → StreamSaver ─────────────────
-  let key: CryptoKey | null = null;
-  let baseIVBytes: Uint8Array | null = null;
+  let decryptor: CryptoDecryptor | null = null;
   if (password && salt && baseIV) {
     const saltBytes = fromBase64(salt);
-    baseIVBytes = fromBase64(baseIV);
-    key = await deriveKey(password, saltBytes);
+    const baseIVBytes = fromBase64(baseIV);
+    decryptor = await makeCryptoDecryptor(password, saltBytes, baseIVBytes);
   }
 
   // ── Multipart mode: stream single S3 object, decrypt chunk-by-chunk ──────────
   // The whole file is one S3 GET. We read the response body as a stream and
   // reassemble each encrypted chunk (fixed chunkSize + 16-byte AES-GCM tag),
   // decrypt it, and pipe the plaintext to StreamSaver — 0 bytes accumulate in heap.
-  if (isMultipart && chunkSize) {
+  if (isMultipart && chunkSize && decryptor) {
     throwIfCancelled();
     const { url, totalChunks: parts, chunkSize: storedChunkSize } =
       await getMultipartDownloadPresignedUrl(roomId, fileId);
@@ -162,7 +277,7 @@ export async function downloadFile(
         const chunkBase = (partIndex / parts) * 100;
         const chunkSlot = 100 / parts;
 
-        onProgress?.({
+        emitProgress({
           phase: "decrypting",
           chunkIndex: partIndex,
           totalChunks: parts,
@@ -175,18 +290,14 @@ export async function downloadFile(
         ) as ArrayBuffer;
 
         let decrypted: ArrayBuffer;
-        if (key && baseIVBytes) {
-          try {
-            decrypted = await decryptChunk(encryptedPart, key, partIndex, baseIVBytes!);
-          } catch {
-            await writer.abort("Decryption failed").catch(() => {});
-            throw new Error("Decryption failed — the password may be incorrect or the data is corrupted.");
-          }
-        } else {
-          decrypted = encryptedPart;
+        try {
+          decrypted = await decryptor!.decrypt(partIndex, encryptedPart);
+        } catch {
+          await writer.abort("Decryption failed").catch(() => {});
+          throw new Error("Decryption failed — the password may be incorrect or the data is corrupted.");
         }
 
-        onProgress?.({
+        emitProgress({
           phase: "writing",
           chunkIndex: partIndex,
           totalChunks: parts,
@@ -196,7 +307,7 @@ export async function downloadFile(
         await writer.write(new Uint8Array(decrypted));
         partIndex++;
 
-        onProgress?.({
+        emitProgress({
           phase: "writing",
           chunkIndex: partIndex,
           totalChunks: parts,
@@ -216,7 +327,7 @@ export async function downloadFile(
         // Emit byte-level download progress while chunks are still accumulating.
         // Cap at 45 % so per-chunk decryption progress (starting at 50 %) never goes backwards.
         if (partIndex === 0 && expectedEncryptedSize > 0) {
-          onProgress?.({
+          emitProgress({
             phase: "downloading",
             chunkIndex: 0,
             totalChunks: parts,
@@ -247,93 +358,111 @@ export async function downloadFile(
       }
 
       await writer.close();
-      onProgress?.({ phase: "writing", chunkIndex: parts, totalChunks: parts, percent: 100 });
+      emitProgress({ phase: "writing", chunkIndex: parts, totalChunks: parts, percent: 100 });
     } catch (err) {
       await writer.abort(err).catch(() => {});
       if (err instanceof Error && err.name === "AbortError") throw new CancelledError();
       throw err;
+    } finally {
+      decryptor.terminate();
     }
     return;
   }
 
-  // Single request for all presigned S3 GET URLs.
+  // ── Legacy chunk-by-chunk mode with CONCURRENT download + decryption ─────────
+  // Download and decrypt multiple chunks simultaneously for maximum throughput.
   throwIfCancelled();
   const { urls } = await getEncryptedDownloadPresignedUrls(roomId, fileId, totalChunks);
 
   const writable = await createStreamSaverWritable(fileName, fileSize);
   const writer = writable.getWriter();
+
   try {
-    // Double-buffer: fetch chunk i+1 while decrypting/writing chunk i.
-    let prefetch: Promise<ArrayBuffer> | null = null;
-    for (let i = 0; i < totalChunks; i++) {
-      throwIfCancelled();
-      // Per-chunk base ensures percent is always monotonically increasing.
-      // Each chunk owns (100 / totalChunks)% of the bar, split: 40 download / 50 decrypt / 10 write.
+    // Concurrent pipeline: download and decrypt up to DOWNLOAD_CONCURRENCY chunks at once
+    const pipeline = new Map<number, Promise<ArrayBuffer>>();
+    let nextFetch = 0;
+    let nextWrite = 0;
+
+    async function startDownloadAndDecrypt(i: number): Promise<void> {
       const chunkBase = (i / totalChunks) * 100;
-      const chunkSize = 100 / totalChunks;
+      const chunkSlot = 100 / totalChunks;
 
-      onProgress?.({
+      emitProgress({
         phase: "downloading",
         chunkIndex: i,
         totalChunks,
-        percent: Math.round(chunkBase + chunkSize * 0.1),
+        percent: Math.round(chunkBase + chunkSlot * 0.2),
       });
 
-      const buffer = prefetch ? await prefetch : await fetchChunkFromUrl(urls[i], signal);
-      prefetch = null;
-      if (i + 1 < totalChunks) prefetch = fetchChunkFromUrl(urls[i + 1], signal);
+      const encrypted = await fetchChunkFromUrl(urls[i], signal);
 
-      onProgress?.({
-        phase: "downloading",
+      emitProgress({
+        phase: "decrypting",
         chunkIndex: i,
         totalChunks,
-        percent: Math.round(chunkBase + chunkSize * 0.4),
+        percent: Math.round(chunkBase + chunkSlot * 0.5),
       });
 
-      let decrypted = buffer;
-      if (key && baseIVBytes) {
-        onProgress?.({
-          phase: "decrypting",
-          chunkIndex: i,
-          totalChunks,
-          percent: Math.round(chunkBase + chunkSize * 0.5),
-        });
+      let decrypted = encrypted;
+      if (decryptor) {
         try {
-          decrypted = await decryptChunk(buffer, key, i, baseIVBytes);
+          decrypted = await decryptor.decrypt(i, encrypted);
         } catch {
-          await writer.abort("Decryption failed").catch(() => {});
           throw new Error("Decryption failed — the password may be incorrect or the data is corrupted.");
         }
-        onProgress?.({
-          phase: "decrypting",
-          chunkIndex: i,
-          totalChunks,
-          percent: Math.round(chunkBase + chunkSize * 0.9),
-        });
       }
 
-      onProgress?.({
-        phase: "writing",
+      emitProgress({
+        phase: "decrypting",
         chunkIndex: i,
         totalChunks,
-        percent: Math.round(chunkBase + chunkSize * 0.9),
+        percent: Math.round(chunkBase + chunkSlot * 0.9),
       });
-      // StreamSaver writer expects Uint8Array, not ArrayBuffer
-      await writer.write(new Uint8Array(decrypted));
 
-      onProgress?.({
-        phase: "writing",
-        chunkIndex: i,
-        totalChunks,
-        percent: Math.round(chunkBase + chunkSize),
+      pipeline.set(i, Promise.resolve(decrypted));
+    }
+
+    // Fill the pipeline with initial batch
+    while (nextFetch < Math.min(DOWNLOAD_CONCURRENCY, totalChunks)) {
+      throwIfCancelled();
+      startDownloadAndDecrypt(nextFetch++).catch(err => {
+        pipeline.set(nextFetch - 1, Promise.reject(err));
       });
     }
+
+    // Write chunks in order, fetching new ones as slots free up
+    while (nextWrite < totalChunks) {
+      throwIfCancelled();
+
+      const decrypted = await pipeline.get(nextWrite)!;
+      pipeline.delete(nextWrite);
+
+      emitProgress({
+        phase: "writing",
+        chunkIndex: nextWrite,
+        totalChunks,
+        percent: Math.round(((nextWrite + 0.95) / totalChunks) * 100),
+      });
+
+      await writer.write(new Uint8Array(decrypted));
+      nextWrite++;
+
+      // Start next download if available
+      if (nextFetch < totalChunks) {
+        startDownloadAndDecrypt(nextFetch++).catch(err => {
+          pipeline.set(nextFetch - 1, Promise.reject(err));
+        });
+      }
+    }
+
     await writer.close();
-    onProgress?.({ phase: "writing", chunkIndex: totalChunks, totalChunks, percent: 100 });
+    emitProgress({ phase: "writing", chunkIndex: totalChunks, totalChunks, percent: 100 });
   } catch (err) {
     await writer.abort(err).catch(() => {});
     if (err instanceof Error && err.name === "AbortError") throw new CancelledError();
     throw err;
+  } finally {
+    decryptor?.terminate();
   }
 }
 

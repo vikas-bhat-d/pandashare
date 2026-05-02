@@ -1,36 +1,51 @@
 import app from "./app";
 import { config } from "./config";
+import { logger, cleanupOldLogs } from "./utils/logger";
 import { ensureAbortIncompleteMultipartLifecycle } from "./services/storage.service";
 import { cleanupExpiredRooms } from "./services/room.service";
+import { cleanupExpiredSnippets } from "./services/text.service";
 
 // --------------------------------------
 // Start server
 // --------------------------------------
 
 app.listen(config.PORT, () => {
-  console.log(`\n  ?? PandaShare API running on http://localhost:${config.PORT}`);
-  console.log(`  ?? S3 endpoint: ${config.S3_ENDPOINT}`);
-  console.log(`  ???  Database: ${config.DATABASE_URL ? "connected" : "not configured"}\n`);
+  logger.info(`PandaShare API running on http://localhost:${config.PORT}`);
+  logger.info(`S3 endpoint: ${config.S3_ENDPOINT || "not configured"}`);
+  logger.info(`Database: ${config.DATABASE_URL ? "connected" : "not configured"}`);
 
   // Set S3 lifecycle rule to auto-abort incomplete multipart uploads after 1 day.
   ensureAbortIncompleteMultipartLifecycle().catch((err) => {
-    console.warn("  ??  Could not set S3 lifecycle rule:", (err as Error).message);
+    logger.warn("Could not set S3 lifecycle rule", { error: (err as Error).message });
   });
-
-  // Periodic expired-room cleanup runs immediately then every 15 minutes.
+ 
+  // Periodic cleanup for expired rooms and snippets runs immediately then every 15 minutes.
   const CLEANUP_INTERVAL_MS = 15 * 60 * 1000;
 
   async function runCleanup() {
     try {
-      const { deleted, errors } = await cleanupExpiredRooms();
-      if (deleted > 0) {
-        console.log(`  ???  Cleanup: deleted ${deleted} expired room(s).`);
+      // Clean up expired rooms (and their S3 files)
+      const roomResults = await cleanupExpiredRooms();
+      if (roomResults.deleted > 0) {
+        logger.info(`Cleanup: deleted ${roomResults.deleted} expired room(s)`);
       }
-      for (const { roomId, error } of errors) {
-        console.warn(`  ??  Cleanup: failed to delete room ${roomId}:`, error.message);
+      for (const { roomId, error } of roomResults.errors) {
+        logger.warn(`Cleanup: failed to delete room`, { roomId, error: error.message });
       }
+
+      // Clean up expired text snippets
+      const snippetResults = await cleanupExpiredSnippets();
+      if (snippetResults.deleted > 0) {
+        logger.info(`Cleanup: deleted ${snippetResults.deleted} expired snippet(s)`);
+      }
+      for (const { snippetId, error } of snippetResults.errors) {
+        logger.warn(`Cleanup: failed to delete snippet`, { snippetId, error: error.message });
+      }
+
+      // Clean up old log files (keep only LOG_RETENTION_DAYS)
+      await cleanupOldLogs();
     } catch (err) {
-      console.warn("  ??  Cleanup: unexpected error:", (err as Error).message);
+      logger.error("Cleanup: unexpected error", { error: (err as Error).message });
     }
   }
 

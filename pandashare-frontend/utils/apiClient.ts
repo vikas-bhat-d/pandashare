@@ -1,5 +1,6 @@
-// apiClient.ts — Centralized HTTP client for PandaShare API
+// apiClient.ts — Centralized HTTP client for PandaShare API (axios-based)
 
+import axios, { AxiosError, AxiosInstance, AxiosRequestConfig, AxiosResponse } from "axios";
 import { generateUUID } from "./utils";
 
 export const BASE_URL = typeof window !== "undefined"
@@ -45,68 +46,82 @@ export class ApiError extends Error {
 }
 
 /**
- * Make a JSON API request. Automatically sets Content-Type and parses response.
+ * Axios instance configured for PandaShare API
+ */
+const apiClient: AxiosInstance = axios.create({
+  baseURL: BASE_URL,
+  timeout: 60000, // 60s timeout for API requests (not for S3 uploads)
+  headers: {
+    "Content-Type": "application/json",
+  },
+});
+
+// Request interceptor: Add device ID to all requests
+apiClient.interceptors.request.use((config) => {
+  const deviceId = getDeviceId();
+  if (deviceId) {
+    config.headers["x-device-id"] = deviceId;
+  }
+  return config;
+});
+
+// Response interceptor: Convert axios errors to ApiError
+apiClient.interceptors.response.use(
+  (response: AxiosResponse) => response,
+  (error: AxiosError) => {
+    if (error.response) {
+      const body = error.response.data;
+      const message = (body as any)?.error || `API error: ${error.response.status}`;
+      throw new ApiError(message, error.response.status, body);
+    }
+    throw error;
+  }
+);
+
+/**
+ * Make a JSON API request. Automatically parses response.
  */
 export async function apiJson<T>(
   path: string,
-  options?: RequestInit
+  config?: AxiosRequestConfig
 ): Promise<T> {
-  const deviceId = getDeviceId();
-  const { headers: optHeaders, ...restOptions } = options ?? {};
-  const res = await fetch(`${BASE_URL}${path}`, {
-    headers: {
-      "Content-Type": "application/json",
-      ...(deviceId ? { "x-device-id": deviceId } : {}),
-      ...(optHeaders as Record<string, string> | undefined),
-    },
-    ...restOptions,
+  const response = await apiClient.request<T>({
+    url: path,
+    method: config?.method || "GET",
+    ...config,
   });
-
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new ApiError(body.error || `API error: ${res.status}`, res.status, body);
-  }
-
-  return res.json();
+  return response.data;
 }
 
 /**
  * Upload a binary chunk. Sets Content-Type to application/octet-stream.
- * Pass additional headers (e.g. x-file-name) via the optional `headers` param.
  */
 export async function apiBinary(
   path: string,
   body: ArrayBuffer,
   headers?: Record<string, string>
 ): Promise<{ ok: boolean }> {
-  const deviceId = getDeviceId();
-  const res = await fetch(`${BASE_URL}${path}`, {
-    method: "POST",
+  const response = await apiClient.post<{ ok: boolean }>(path, body, {
     headers: {
       "Content-Type": "application/octet-stream",
-      ...(deviceId ? { "x-device-id": deviceId } : {}),
       ...headers,
     },
-    body,
   });
-
-  if (!res.ok) {
-    const errBody = await res.json().catch(() => ({}));
-    throw new ApiError(errBody.error || `Upload failed: ${res.status}`, res.status, errBody);
-  }
-
-  return res.json();
+  return response.data;
 }
 
 /**
  * Download a binary chunk. Returns raw ArrayBuffer.
  */
 export async function apiDownload(path: string): Promise<ArrayBuffer> {
-  const res = await fetch(`${BASE_URL}${path}`);
-
-  if (!res.ok) {
-    throw new ApiError(`Download failed: ${res.status}`, res.status);
-  }
-
-  return res.arrayBuffer();
+  const response = await apiClient.get<ArrayBuffer>(path, {
+    responseType: "arraybuffer",
+  });
+  return response.data;
 }
+
+/**
+ * Export the configured axios instance for direct use when needed
+ * (e.g., for presigned URLs with custom progress callbacks)
+ */
+export { apiClient };

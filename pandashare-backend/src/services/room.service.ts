@@ -124,6 +124,33 @@ export async function updateExpiry(id: string, hours: number) {
 }
 
 /**
+ * Get all rooms (for admin view).
+ */
+export async function getAllRooms() {
+  return prisma.room.findMany({
+    orderBy: { createdAt: "desc" },
+    select: {
+      id: true,
+      name: true,
+      mode: true,
+      createdAt: true,
+      expiresAt: true,
+      _count: { select: { files: true } },
+    },
+  });
+}
+
+/**
+ * Set a room's expiresAt to now so the next cleanup cycle deletes it.
+ */
+export async function expireRoom(id: string) {
+  return prisma.room.update({
+    where: { id },
+    data: { expiresAt: new Date() },
+  });
+}
+
+/**
  * Get all expired rooms for cleanup.
  */
 export async function getExpiredRooms() {
@@ -166,7 +193,7 @@ export async function cleanupExpiredRooms(): Promise<{
     try {
       // 1. Remove all S3 objects for this room's files
       await deleteRoomS3Files(room.id, room.files);
-
+      
       // 2. Remove the room (and cascade-delete File rows) from the DB
       await deleteRoom(room.id);
 

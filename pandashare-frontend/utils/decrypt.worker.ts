@@ -1,12 +1,12 @@
 /// <reference lib="webworker" />
-// Runs entirely in a Web Worker thread — keeps the main thread free to
-// handle React renders and user interactions during upload.
+// Runs decryption in a Web Worker thread — keeps the main thread free to
+// handle React renders and user interactions during download.
 //
 // Protocol:
 //   Main → Worker  { type:"init",    password, salt: ArrayBuffer, baseIV: ArrayBuffer }
 //   Worker → Main  { type:"ready" }  |  { type:"error", message }
 //
-//   Main → Worker  { type:"encrypt", id, buffer: ArrayBuffer, chunkIndex }  [buffer transferred]
+//   Main → Worker  { type:"decrypt", id, buffer: ArrayBuffer, chunkIndex }  [buffer transferred]
 //   Worker → Main  { type:"done",    id, buffer: ArrayBuffer }              [buffer transferred]
 //                | { type:"error",   id, message }
 
@@ -18,7 +18,7 @@ const PBKDF2_ITERATIONS = 100_000;
 
 type InMsg =
   | { type: "init"; password: string; salt: ArrayBuffer; baseIV: ArrayBuffer }
-  | { type: "encrypt"; id: number; buffer: ArrayBuffer; chunkIndex: number };
+  | { type: "decrypt"; id: number; buffer: ArrayBuffer; chunkIndex: number };
 
 let key: CryptoKey | null = null;
 let baseIV: Uint8Array | null = null;
@@ -28,7 +28,7 @@ function makeIV(chunkIndex: number): ArrayBuffer {
   const buf = new ArrayBuffer(12);
   const iv = new Uint8Array(buf);
   iv.set(baseIV!);
-  // Add chunkIndex to the last 4 bytes (big-endian), matching encryptChunk() in crypto.ts
+  // Add chunkIndex to the last 4 bytes (big-endian), matching decryptChunk() in crypto.ts
   const view = new DataView(buf);
   view.setUint32(8, view.getUint32(8) + chunkIndex);
   return buf;
@@ -50,7 +50,7 @@ self.onmessage = async ({ data }: MessageEvent<InMsg>) => {
         raw,
         { name: ALGO, length: 256 },
         false,
-        ["encrypt"]
+        ["decrypt"]
       );
       baseIV = new Uint8Array(data.baseIV);
       self.postMessage({ type: "ready" });
@@ -60,7 +60,7 @@ self.onmessage = async ({ data }: MessageEvent<InMsg>) => {
     return;
   }
 
-  if (data.type === "encrypt") {
+  if (data.type === "decrypt") {
     if (!key || !baseIV) {
       self.postMessage({ type: "error", id: data.id, message: "Worker not initialized" });
       return;
@@ -68,10 +68,10 @@ self.onmessage = async ({ data }: MessageEvent<InMsg>) => {
     try {
       const iv = makeIV(data.chunkIndex);
       // data.buffer arrives as ArrayBuffer (transferred); cast plain for BufferSource compat
-      const plain = data.buffer as ArrayBuffer;
-      const encrypted = await crypto.subtle.encrypt({ name: ALGO, iv }, key, plain);
+      const encrypted = data.buffer as ArrayBuffer;
+      const decrypted = await crypto.subtle.decrypt({ name: ALGO, iv }, key, encrypted);
       // Transfer the result back — zero-copy, worker releases the buffer
-      self.postMessage({ type: "done", id: data.id, buffer: encrypted }, [encrypted]);
+      self.postMessage({ type: "done", id: data.id, buffer: decrypted }, [decrypted]);
     } catch (err) {
       self.postMessage({ type: "error", id: data.id, message: String(err) });
     }

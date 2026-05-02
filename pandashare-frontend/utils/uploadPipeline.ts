@@ -1,5 +1,6 @@
 // uploadPipeline.ts — Orchestrates chunked encryption + upload
 
+import axios, { AxiosError, CancelTokenSource } from "axios";
 import { encryptChunk, deriveKey } from "./crypto";
 import { generateUUID } from "./utils";
 import { BASE_URL } from "./apiClient";
@@ -129,8 +130,8 @@ export async function cleanupStaleUploads(): Promise<void> {
 
 /**
  * Max number of chunks to encrypt+upload concurrently for password mode.
- * 3 is a sweet spot: saturates a typical broadband connection without
- * hammering the server or exhausting the rate limit.
+ * 3 balances throughput with connection stability - too many large concurrent
+ * uploads can cause timeouts and make requests appear "stuck".
  */
 const CHUNK_CONCURRENCY = 3;
 
@@ -228,6 +229,7 @@ function makeProgressEmitter(
   let lastMs = 0;
   return (p: UploadProgress) => {
     const now = Date.now();
+    // Emit at most every 120ms (~8 fps), but always emit 0% and ≥99%
     if (p.percent === 0 || p.percent >= 99 || now - lastMs >= 120) {
       lastMs = now;
       cb(p);
@@ -264,72 +266,84 @@ async function runConcurrently(
 }
 
 /**
- * PUT an encrypted ArrayBuffer to a presigned S3 UploadPart URL.
+ * PUT an encrypted ArrayBuffer to a presigned S3 UploadPart URL with upload progress.
  * Returns the ETag from the response header — required by CompleteMultipartUpload.
  * S3 CORS must include `ExposeHeaders: ["ETag"]` for the browser to read it.
+ * 
+ * Uses axios for cleaner API and built-in upload progress support.
  */
-async function putPartToPresignedUrl(url: string, data: ArrayBuffer, signal?: AbortSignal): Promise<string> {
-  const res = await fetch(url, {
-    method: "PUT",
-    headers: { "Content-Type": "application/octet-stream" },
-    body: data,
-    signal,
-  });
-  if (!res.ok) throw new Error(`S3 part upload failed: ${res.status} ${res.statusText}`);
-  const etag = res.headers.get("ETag");
-  if (!etag) throw new Error("S3 did not return an ETag for the uploaded part. Ensure CORS ExposeHeaders includes ETag.");
-  return etag;
+async function putPartToPresignedUrl(
+  url: string, 
+  data: ArrayBuffer, 
+  signal?: AbortSignal,
+  onProgress?: (loaded: number, total: number) => void
+): Promise<string> {
+  try {
+    const response = await axios.put(url, data, {
+      headers: {
+        "Content-Type": "application/octet-stream",
+      },
+      signal,
+      onUploadProgress: (progressEvent) => {
+        if (progressEvent.total && onProgress) {
+          onProgress(progressEvent.loaded, progressEvent.total);
+        }
+      },
+    });
+
+    const etag = response.headers["etag"];
+    if (!etag) {
+      throw new Error("S3 did not return an ETag for the uploaded part. Ensure CORS ExposeHeaders includes ETag.");
+    }
+    return etag;
+  } catch (err) {
+    if (axios.isCancel(err) || (err instanceof Error && err.name === "AbortError")) {
+      throw new CancelledError();
+    }
+    if (axios.isAxiosError(err)) {
+      throw new Error(`S3 part upload failed: ${err.response?.status || err.message}`);
+    }
+    throw err;
+  }
 }
 
 /**
- * PUT a File directly to a presigned S3 URL via XHR so we get upload progress.
- * fetch() does not expose upload progress; XHR does via `upload.onprogress`.
+ * PUT a File directly to a presigned S3 URL via axios with upload progress.
  */
-function putToPresignedUrl(
+async function putToPresignedUrl(
   url: string,
   file: File,
   onProgress?: (progress: UploadProgress) => void,
   signal?: AbortSignal
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open("PUT", url);
-    xhr.setRequestHeader("Content-Type", "application/octet-stream");
-
-    // Forward AbortSignal to the XHR
-    if (signal) {
-      if (signal.aborted) {
-        reject(new CancelledError());
-        return;
-      }
-      signal.addEventListener("abort", () => xhr.abort(), { once: true });
-    }
-
-    xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable) {
-        onProgress?.({
-          phase: "uploading",
-          chunkIndex: 0,
-          totalChunks: 1,
+  try {
+    await axios.put(url, file, {
+      headers: {
+        "Content-Type": "application/octet-stream",
+      },
+      signal,
+      onUploadProgress: (progressEvent) => {
+        if (progressEvent.total && onProgress) {
           // Reserve the last 1% for the /complete call
-          percent: Math.min(98, Math.round((e.loaded / e.total) * 98)),
-        });
-      }
-    };
-
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        resolve();
-      } else {
-        reject(new Error(`S3 upload failed: ${xhr.status} ${xhr.statusText}`));
-      }
-    };
-
-    xhr.onerror = () => reject(new Error("S3 upload failed: network error"));
-    xhr.onabort = () => reject(new CancelledError());
-
-    xhr.send(file);
-  });
+          const percent = Math.min(98, Math.round((progressEvent.loaded / progressEvent.total) * 98));
+          onProgress({
+            phase: "uploading",
+            chunkIndex: 0,
+            totalChunks: 1,
+            percent,
+          });
+        }
+      },
+    });
+  } catch (err) {
+    if (axios.isCancel(err) || (err instanceof Error && err.name === "AbortError")) {
+      throw new CancelledError();
+    }
+    if (axios.isAxiosError(err)) {
+      throw new Error(`S3 upload failed: ${err.response?.status || err.message}`);
+    }
+    throw err;
+  }
 }
 
 /**
@@ -419,26 +433,26 @@ export async function uploadFile(
   //    Parts are 1-indexed for S3; ETags indexed by part number (0-based array).
   const etags: string[] = new Array(totalChunks);
   let completedChunks = 0;
-  let encryptedChunks = 0;
 
   try {
     await runConcurrently(totalChunks, CHUNK_CONCURRENCY, async (i) => {
       throwIfCancelled();
       const start = i * CHUNK_SIZE;
       const end = Math.min(start + CHUNK_SIZE, file.size);
+      
+      // Show initial progress for first chunk only to give immediate feedback
+      if (i === 0) {
+        emit({
+          phase: "encrypting",
+          chunkIndex: 0,
+          totalChunks,
+          percent: 1,
+        });
+      }
+
       // Read the raw chunk; transfer it to the worker (zero-copy) if encrypting
       let buffer = await file.slice(start, end).arrayBuffer();
       throwIfCancelled();
-
-      // Emit "encrypting chunk i" so the progress bar moves immediately — before the
-      // PBKDF2-derived key is used and before the S3 PUT. This prevents the bar from
-      // sitting at 0 % for the entire key-derivation + first-chunk duration.
-      emit({
-        phase: "encrypting",
-        chunkIndex: i,
-        totalChunks,
-        percent: Math.max(1, Math.round((i / totalChunks) * 49)),
-      });
 
       if (encryptor) {
         // Worker encrypts off the main thread; buffer is transferred (zero-copy)
@@ -446,25 +460,18 @@ export async function uploadFile(
       }
       throwIfCancelled();
 
-      encryptedChunks++;
-      // Transition bar to the "uploading" phase (49–98 %) once encryption is done.
-      emit({
-        phase: "uploading",
-        chunkIndex: encryptedChunks,
-        totalChunks,
-        percent: Math.round(49 + (encryptedChunks / totalChunks) * 49),
-      });
-
       // PUT directly to S3 — no rate-limit hit; capture ETag for CompleteMultipartUpload
       // withRetry handles transient S3 / network errors (up to 4 attempts, exponential backoff)
       etags[i] = await withRetry(() => putPartToPresignedUrl(urls[i], buffer, signal), signal);
 
+      // Only emit progress AFTER upload completes (not after encryption)
+      // This prevents the bar from jumping ahead when chunks are still uploading
       completedChunks++;
       emit({
         phase: "uploading",
         chunkIndex: completedChunks,
         totalChunks,
-        percent: Math.round((completedChunks / totalChunks) * 98),
+        percent: Math.min(98, Math.round((completedChunks / totalChunks) * 98)),
       });
     });
   } catch (err) {

@@ -161,10 +161,63 @@ export async function deleteSnippet(id: string) {
 }
 
 /**
+ * Get all snippets (for admin view).
+ */
+export async function getAllSnippets() {
+  return prisma.textSnippet.findMany({
+    orderBy: { createdAt: "desc" },
+    select: {
+      id: true,
+      name: true,
+      mode: true,
+      createdAt: true,
+      expiresAt: true,
+    },
+  });
+}
+
+/**
+ * Set a snippet's expiresAt to now so the next cleanup cycle deletes it.
+ */
+export async function expireSnippet(id: string) {
+  return prisma.textSnippet.update({
+    where: { id },
+    data: { expiresAt: new Date() },
+  });
+}
+
+/**
  * Return all expired snippets for cleanup.
  */
 export async function getExpiredSnippets() {
   return prisma.textSnippet.findMany({
     where: { expiresAt: { lt: new Date() } },
   });
+}
+
+/**
+ * Delete all expired text snippets from the database.
+ * Text snippets don't use S3 storage — all content is in the database.
+ * 
+ * @returns counts of successfully deleted snippets and any errors encountered.
+ */
+export async function cleanupExpiredSnippets(): Promise<{
+  deleted: number;
+  errors: Array<{ snippetId: string; error: Error }>;
+}> {
+  const expiredSnippets = await getExpiredSnippets();
+
+  let deleted = 0;
+  const errors: Array<{ snippetId: string; error: Error }> = [];
+
+  for (const snippet of expiredSnippets) {
+    try {
+      await deleteSnippet(snippet.id);
+      deleted++;
+    } catch (err) {
+      errors.push({ snippetId: snippet.id, error: err as Error });
+    }
+  }
+
+  return { deleted, errors };
 }

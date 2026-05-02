@@ -14,4 +14,6 @@ export const config = {
   MAX_FILE_SIZE: 2 * 1024 * 1024 * 1024, // 2GB
   CHUNK_SIZE: 5 * 1024 * 1024, // 5MB
   MAX_EXPIRY_HOURS: 48,
+  ADMIN_PASSWORD: process.env.ADMIN_PASSWORD || "1234",
+  LOG_RETENTION_DAYS: parseInt(process.env.LOG_RETENTION_DAYS || "3"),
 };

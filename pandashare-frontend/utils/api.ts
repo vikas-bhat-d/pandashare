@@ -44,7 +44,7 @@ export async function createRoom(data: {
 }): Promise<RoomMetadata> {
   return apiJson<RoomMetadata>("/api/rooms", {
     method: "POST",
-    body: JSON.stringify(data),
+    data,
   });
 }
 
@@ -88,7 +88,7 @@ export async function getRoomFiles(
 export async function updateRoomExpiry(id: string, hours: number): Promise<{ expiresAt: string }> {
   return apiJson<{ expiresAt: string }>(`/api/rooms/${encodeURIComponent(id)}/expiry`, {
     method: "PATCH",
-    body: JSON.stringify({ hours }),
+    data: { hours },
   });
 }
 
@@ -117,7 +117,7 @@ export async function createSnippet(data: {
 }): Promise<SnippetMetadata> {
   return apiJson<SnippetMetadata>("/api/snippets", {
     method: "POST",
-    body: JSON.stringify(data),
+    data,
   });
 }
 
@@ -149,7 +149,7 @@ export async function getSnippetContent(
 export async function updateSnippetExpiry(id: string, days: number): Promise<{ expiresAt: string }> {
   return apiJson<{ expiresAt: string }>(`/api/snippets/${encodeURIComponent(id)}/expiry`, {
     method: "PATCH",
-    body: JSON.stringify({ days }),
+    data: { days },
   });
 }
 
@@ -162,7 +162,7 @@ export async function updateSnippetContent(
 ): Promise<SnippetMetadata> {
   return apiJson<SnippetMetadata>(`/api/snippets/${encodeURIComponent(id)}/content`, {
     method: "PATCH",
-    body: JSON.stringify({ content, salt, baseIV }),
+    data: { content, salt, baseIV },
     ...(verifier ? { headers: { "x-snippet-verifier": verifier } } : {}),
   });
 }
@@ -194,7 +194,7 @@ export async function getEncryptedUploadPresignedUrls(
 ): Promise<{ urls: string[] }> {
   return apiJson<{ urls: string[] }>("/api/upload/encrypted/presign", {
     method: "POST",
-    body: JSON.stringify({ roomId, fileId, fileName, size, totalChunks }),
+    data: { roomId, fileId, fileName, size, totalChunks },
   });
 }
 
@@ -210,7 +210,7 @@ export async function getPublicUploadPresignedUrl(
 ): Promise<{ url: string }> {
   return apiJson<{ url: string }>("/api/public-upload/presign", {
     method: "POST",
-    body: JSON.stringify({ roomId, fileId, fileName, size }),
+    data: { roomId, fileId, fileName, size },
   });
 }
 
@@ -226,7 +226,7 @@ export async function completePublicUpload(
 ): Promise<void> {
   await apiJson("/api/public-upload/complete", {
     method: "POST",
-    body: JSON.stringify({ roomId, fileId, fileName, size }),
+    data: { roomId, fileId, fileName, size },
   });
 }
 
@@ -237,7 +237,7 @@ export async function completeUpload(
 ): Promise<void> {
   await apiJson(`/api/complete/${encodeURIComponent(roomId)}`, {
     method: "POST",
-    body: JSON.stringify({ fileId, ...data }),
+    data: { fileId, ...data },
   });
 }
 
@@ -257,7 +257,7 @@ export async function initiateMultipartUpload(
 ): Promise<{ uploadId: string; urls: string[] }> {
   return apiJson<{ uploadId: string; urls: string[] }>("/api/upload/multipart/initiate", {
     method: "POST",
-    body: JSON.stringify({ roomId, fileId, fileName, size, totalParts, chunkSize }),
+    data: { roomId, fileId, fileName, size, totalParts, chunkSize },
   });
 }
 
@@ -277,7 +277,7 @@ export async function completeMultipartUpload(
 ): Promise<void> {
   await apiJson("/api/upload/multipart/complete", {
     method: "POST",
-    body: JSON.stringify({ roomId, fileId, fileName, size, totalParts, chunkSize, uploadId, parts }),
+    data: { roomId, fileId, fileName, size, totalParts, chunkSize, uploadId, parts },
   });
 }
 
@@ -294,7 +294,7 @@ export async function abortMultipartUpload(
   try {
     await apiJson("/api/upload/multipart/abort", {
       method: "POST",
-      body: JSON.stringify({ roomId, fileId, uploadId }),
+      data: { roomId, fileId, uploadId },
     });
   } catch {
     // best-effort — S3 also expires incomplete multipart uploads via lifecycle rules
@@ -326,7 +326,7 @@ export async function getEncryptedDownloadPresignedUrls(
 ): Promise<{ urls: string[] }> {
   return apiJson<{ urls: string[] }>("/api/download/encrypted/presign", {
     method: "POST",
-    body: JSON.stringify({ roomId, fileId, totalChunks }),
+    data: { roomId, fileId, totalChunks },
   });
 }
 
@@ -348,7 +348,7 @@ export async function getMultipartDownloadPresignedUrl(
 ): Promise<{ url: string; totalChunks: number; chunkSize: number }> {
   return apiJson<{ url: string; totalChunks: number; chunkSize: number }>(
     "/api/download/multipart/presign",
-    { method: "POST", body: JSON.stringify({ roomId, fileId }) }
+    { method: "POST", data: { roomId, fileId } }
   );
 }
 
@@ -383,4 +383,111 @@ export function fromBase64(base64: string): Uint8Array {
     bytes[i] = binary_string.charCodeAt(i);
   }
   return bytes;
+}
+
+// ──────────────────────────────────────
+// Admin API
+// ──────────────────────────────────────
+
+export interface AdminRoomRecord {
+  id: string;
+  name: string;
+  mode: "password" | "public";
+  createdAt: string;
+  expiresAt: string;
+  _count: { files: number };
+}
+
+export interface AdminSnippetRecord {
+  id: string;
+  name: string;
+  mode: "password" | "public";
+  createdAt: string;
+  expiresAt: string;
+}
+
+function adminHeaders(password: string) {
+  return { "x-admin-password": password };
+}
+
+export async function adminGetRooms(password: string): Promise<AdminRoomRecord[]> {
+  const res = await apiJson<{ rooms: AdminRoomRecord[] }>("/api/admin/rooms", {
+    headers: adminHeaders(password),
+  });
+  return res.rooms;
+}
+
+export async function adminExpireRoom(password: string, id: string): Promise<void> {
+  await apiJson(`/api/admin/rooms/${encodeURIComponent(id)}/expire`, {
+    method: "POST",
+    headers: adminHeaders(password),
+  });
+}
+
+export async function adminExpireAllRooms(password: string): Promise<{ count: number }> {
+  return apiJson<{ count: number }>("/api/admin/rooms/expire-all", {
+    method: "POST",
+    headers: adminHeaders(password),
+  });
+}
+
+export async function adminGetSnippets(password: string): Promise<AdminSnippetRecord[]> {
+  const res = await apiJson<{ snippets: AdminSnippetRecord[] }>("/api/admin/snippets", {
+    headers: adminHeaders(password),
+  });
+  return res.snippets;
+}
+
+export async function adminExpireSnippet(password: string, id: string): Promise<void> {
+  await apiJson(`/api/admin/snippets/${encodeURIComponent(id)}/expire`, {
+    method: "POST",
+    headers: adminHeaders(password),
+  });
+}
+
+export async function adminExpireAllSnippets(password: string): Promise<{ count: number }> {
+  return apiJson<{ count: number }>("/api/admin/snippets/expire-all", {
+    method: "POST",
+    headers: adminHeaders(password),
+  });
+}
+
+export interface LogFile {
+  file: string;
+  lines: number;
+}
+
+export interface LogEntry {
+  timestamp?: string;
+  level?: string;
+  message?: string;
+  meta?: any;
+  raw?: string;
+}
+
+export interface LogsPage {
+  file: string;
+  total: number;
+  offset: number;
+  limit: number;
+  lines: LogEntry[];
+}
+
+export async function adminGetLogFiles(password: string): Promise<LogFile[]> {
+  const res = await apiJson<{ logs: LogFile[] }>("/api/admin/logs", {
+    headers: adminHeaders(password),
+  });
+  return res.logs;
+}
+
+export async function adminGetLogContent(
+  password: string,
+  filename: string,
+  limit = 100,
+  offset = 0
+): Promise<LogsPage> {
+  return apiJson<LogsPage>(`/api/admin/logs/${encodeURIComponent(filename)}`, {
+    headers: adminHeaders(password),
+    params: { limit, offset },
+  });
 }

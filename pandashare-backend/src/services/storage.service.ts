@@ -421,11 +421,10 @@ export async function deleteRoomS3Files(
         keys.push(getChunkKey(roomId, file.id, i));
       }
     } else {
-      // Public (unencrypted) file stored as a single object
+      // Public (unencrypted) file — totalChunks is 0, stored as a single object
       keys.push(getPublicKey(roomId, file.id));
     }
   }
-
   if (keys.length === 0) return;
 
   const batchSize = 1000;

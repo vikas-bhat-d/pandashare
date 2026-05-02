@@ -8,6 +8,7 @@ import roomRoutes from "./routes/rooms";
 import uploadRoutes from "./routes/upload";
 import downloadRoutes from "./routes/download";
 import textRoutes from "./routes/text";
+import adminRoutes from "./routes/admin";
 
 const app = express();
 
@@ -20,7 +21,7 @@ app.use(
   cors({
     origin: config.CORS_ORIGIN,
     methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "x-room-verifier", "x-snippet-verifier", "x-file-name", "x-device-id"],
+    allowedHeaders: ["Content-Type", "x-room-verifier", "x-snippet-verifier", "x-file-name", "x-device-id", "x-admin-password"],
   })
 );
 app.use(apiLimiter);
@@ -36,6 +37,7 @@ app.use("/api", roomRoutes);
 app.use("/api", uploadRoutes);
 app.use("/api", downloadRoutes);
 app.use("/api", textRoutes);
+app.use("/api", adminRoutes);
 
 // Health check endpoint
 app.get("/health", (_req, res) => {

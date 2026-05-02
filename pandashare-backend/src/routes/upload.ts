@@ -183,7 +183,7 @@ router.post(
         fileId,
         roomId,
         fileName,
-        totalChunks: 1,
+        totalChunks: 0, // public files aren't chunked — 0 lets deleteRoomS3Files pick the public/ key
         size,
       });
 

@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from "express";
 import { ZodError } from "zod";
+import { logger } from "../utils/logger";
 
 export function errorHandler(
   err: Error & { code?: string },
@@ -7,7 +8,7 @@ export function errorHandler(
   res: Response,
   _next: NextFunction
 ) {
-  console.error("[ERROR]", err.message);
+  logger.error("Unhandled error", { message: err.message, code: (err as any).code });
 
   // Zod validation error
   if (err instanceof ZodError) {
